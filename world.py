@@ -1,0 +1,201 @@
+"""Campus Crisis simulation: A*, roles, fog, multi-student rescue."""
+from dataclasses import dataclass
+import heapq
+import math
+import json
+from pathlib import Path
+
+TILE=32; COLS,ROWS=28,20
+BUILDINGS=[(5,3,6,5,'LIBRARY'),(16,3,7,5,'SCIENCE'),(6,12,6,5,'LECTURE HALL'),(18,12,6,5,'CAFETERIA')]
+WALLS={(x,y) for bx,by,w,h,_ in BUILDINGS for x in range(bx,bx+w) for y in range(by,by+h)}
+SAFE=(1,15,4,4)
+def center(c): return ((c[0]+.5)*TILE,(c[1]+.5)*TILE)
+def cell(p): return (int(p[0]//TILE),int(p[1]//TILE))
+def walkable(p): return 0<=p[0]<COLS and 0<=p[1]<ROWS and p not in WALLS
+def pathfind(start,goal):
+    if not walkable(start) or not walkable(goal): return []
+    frontier=[(0,start)]; cost={start:0}; came={}
+    while frontier:
+        _,cur=heapq.heappop(frontier)
+        if cur==goal:
+            out=[]
+            while cur!=start: out.append(cur); cur=came[cur]
+            return out[::-1]
+        for dx,dy in ((1,0),(-1,0),(0,1),(0,-1)):
+            nxt=(cur[0]+dx,cur[1]+dy); score=cost[cur]+1
+            if walkable(nxt) and score<cost.get(nxt,math.inf):
+                cost[nxt]=score; came[nxt]=cur
+                heapq.heappush(frontier,(score+abs(goal[0]-nxt[0])+abs(goal[1]-nxt[1]),nxt))
+    return []
+@dataclass
+class Actor:
+    x:float; y:float; role:str; name:str=''; hp:float=100; state:str='Idle'; facing:tuple=(0,1); moving:bool=False; flash:float=0; task:str='Idle'; task_score:int=0; last_seen:tuple|None=None; search_time:float=0; cooldown:float=0; stun:float=0; patrol:int=0
+    @property
+    def pos(self): return (self.x,self.y)
+    @property
+    def alive(self): return self.hp>0
+@dataclass
+class Pickup:
+    x:float; y:float; kind:str; name:str; discovered:bool=False; collected:bool=False
+    @property
+    def pos(self): return (self.x,self.y)
+class Game:
+    def __init__(self):
+        self.leader=Actor(*center((3,16)),'Leader','Leader'); self.rescuer=Actor(*center((4,14)),'Rescuer','Rescuer'); self.medic=Actor(*center((2,14)),'Medic','Medic'); self.defender=Actor(*center((5,16)),'Defender','Defender'); self.scout=Actor(*center((3,12)),'Scout','Scout')
+        self.students=[Actor(*center(c),'Student',f'Student-{i+1}',state='Waiting') for i,c in enumerate(((24,4),(14,10),(26,16)))]
+        self.zombies=[Actor(*center(c),'Zombie',f'Zombie-{i+1}',state='Patrol') for i,c in enumerate(((25,10),(10,18),(14,2)))]
+        self.pickups=[Pickup(*center(c),kind,f'{kind.title()}-{i+1}') for i,(kind,c) in enumerate((('medkit',(8,10)),('ammo',(23,16)),('fuel',(15,18)),('fuel',(13,2)),('medkit',(26,8))))]
+        self.student,self.zombie=self.students[0],self.zombies[0]; self.actors=[self.leader,self.rescuer,self.medic,self.defender,self.scout,*self.students,*self.zombies]
+        self.time=240.; self.elapsed=0.; self.result=None; self.order='Follow'; self.escort_student=None; self.defender_target=None; self.medkits=3; self.ammo=20; self.fuel=0; self.fuel_required=1; self.shove_cooldown=0; self.routes={}; self.scout_points=[(3,3),(10,2),(14,8),(25,4),(26,14),(16,18),(7,18)]; self.scout_point=0; self.revealed=set()
+        self.discovered={'Student':False,'Zombie':False,**{a.name:False for a in (*self.students,*self.zombies)}}; self.reveal(self.leader.pos,2.5); self.reveal(self.scout.pos,3); self.logs=['Three students require extraction.','Scout: searching unexplored campus sectors.','Queue the rescue order with E.']
+        self.stats={'students_rescued':0,'zombies_neutralized':0,'medkits_used':0,'damage_taken':0,'task_changes':0}
+    @property
+    def rescued_count(self): return sum(s.state=='Rescued' for s in self.students)
+    def log(self,msg): self.logs=(self.logs+[msg])[-6:]
+    def collect(self,pickup,collector):
+        pickup.collected=True
+        if pickup.kind=='medkit': self.medkits+=1
+        elif pickup.kind=='ammo': self.ammo+=6
+        else: self.fuel+=1
+        self.log(f'{collector.role}: collected {pickup.kind}.')
+    def save_stats(self):
+        record={**self.stats,'outcome':self.result,'time_remaining':round(self.time,1),'fuel':self.fuel,'ammo':self.ammo}
+        path=Path(__file__).parent/'logs'/'mission_history.json'; path.parent.mkdir(exist_ok=True)
+        history=json.loads(path.read_text()) if path.exists() else []; history.append(record); path.write_text(json.dumps(history,indent=2))
+    def task_score(self,p,s,d,r=0): return round(p+s-d/24-r)
+    def assign(self,a,task,score,msg):
+        a.state,a.task_score=task,score
+        if a.task!=task: a.task=task; self.stats['task_changes']+=1; self.log(f'{a.role}: {msg} [score {score}]')
+    def command(self,order):
+        if not self.result and self.rescuer.alive: self.order=order; self.log({'Rescue':'Rescuer: rescue queue active; awaiting Scout intel.','Follow':'Rescuer: following Commander.','Hold':'Rescuer: holding position.'}[order])
+    def reveal(self,pos,radius):
+        o=cell(pos)
+        for y in range(max(0,o[1]-4),min(ROWS,o[1]+5)):
+            for x in range(max(0,o[0]-4),min(COLS,o[0]+5)):
+                if math.dist((x,y),o)<=radius:self.revealed.add((x,y))
+    def discover(self,a,msg):
+        if not self.discovered[a.name]: self.discovered[a.name]=True; self.discovered[a.role]=True; self.log('Scout: '+msg)
+    def clear_at(self,x,y): return all(walkable(cell((x+dx,y+dy))) for dx in (-9,9) for dy in (-9,9))
+    def move(self,a,dx,dy):
+        before=a.pos
+        if self.clear_at(a.x+dx,a.y):a.x+=dx
+        if self.clear_at(a.x,a.y+dy):a.y+=dy
+        # Ignore sub-pixel collision corrections so an idle agent does not keep
+        # triggering the walk animation and appear to vibrate in place.
+        a.moving=math.dist(before,a.pos)>.25
+        if a.moving:
+            n=math.hypot(dx,dy); a.facing=(dx/n,dy/n)
+    def navigate(self,a,dest,speed,dt,stop=5):
+        if math.dist(a.pos,dest)<stop:return
+        start,end=cell(a.pos),cell(dest); route=pathfind(start,end); self.routes[a.name]=route
+        if start==end: target=dest
+        elif not route:return
+        else:
+            here,nxt=center(start),center(route[0]); target=here if ((nxt[0]!=here[0] and abs(a.y-here[1])>1) or (nxt[1]!=here[1] and abs(a.x-here[0])>1)) else nxt
+        dx,dy=target[0]-a.x,target[1]-a.y; dist=math.hypot(dx,dy)
+        if dist:self.move(a,dx/dist*min(speed*dt,dist),dy/dist*min(speed*dt,dist))
+    def visible(self,a,b):
+        steps=max(1,int(math.dist(a,b)/6)); return all(walkable(cell((a[0]+(b[0]-a[0])*i/steps,a[1]+(b[1]-a[1])*i/steps))) for i in range(steps+1))
+    def nearest(self,pos): return min((z for z in self.zombies if z.alive),key=lambda z:math.dist(pos,z.pos),default=None)
+    def shove(self):
+        if self.result or self.shove_cooldown:return
+        self.shove_cooldown=.65; z=min((z for z in self.zombies if z.alive and math.dist(z.pos,self.leader.pos)<64 and self.visible(z.pos,self.leader.pos)),key=lambda z:math.dist(z.pos,self.leader.pos),default=None)
+        if z:z.hp=max(0,z.hp-34); z.flash=.25; z.stun=.5; z.state='Stunned' if z.alive else 'Dead'; self.log('Commander: zombie neutralized.' if not z.alive else 'Commander: zombie stunned!')
+    def scout_ai(self,dt):
+        a=self.scout; danger=self.nearest(a.pos)
+        # Use hysteresis: a Scout that spots danger commits to its retreat instead
+        # of flipping between Explore and Avoid at the exact vision boundary.
+        if danger and math.dist(a.pos,danger.pos)<110 and self.visible(a.pos,danger.pos): a.cooldown=1.5
+        if a.cooldown>0: self.assign(a,'Avoid Zombie',self.task_score(80,50,math.dist(a.pos,self.leader.pos)),'danger detected; returning to Commander'); self.navigate(a,self.leader.pos,124,dt,52)
+        else:
+            dest=center(self.scout_points[self.scout_point]); self.assign(a,f'Explore Sector {self.scout_point+1}',self.task_score(55,55,math.dist(a.pos,dest)),f'exploring sector {self.scout_point+1}'); self.navigate(a,dest,108,dt,7)
+            if math.dist(a.pos,dest)<9:self.scout_point=(self.scout_point+1)%len(self.scout_points)
+        self.reveal(a.pos,3.6); self.reveal(self.leader.pos,2.2)
+        for s in self.students:
+            if s.state=='Waiting' and math.dist(a.pos,s.pos)<150 and self.visible(a.pos,s.pos):self.discover(s,f'survivor found: {s.name}; transmitting rescue location.')
+        for z in self.zombies:
+            if z.alive and math.dist(a.pos,z.pos)<170 and self.visible(a.pos,z.pos):self.discover(z,f'{z.name} sighted; sharing threat location.')
+        for pickup in self.pickups:
+            if not pickup.collected and not pickup.discovered and math.dist(a.pos,pickup.pos)<145 and self.visible(a.pos,pickup.pos):
+                pickup.discovered=True; self.log(f'Scout: {pickup.kind} located at {pickup.name}.')
+    def rescuer_ai(self,dt):
+        r=self.rescuer
+        if self.order=='Rescue':
+            if self.escort_student:
+                s=self.escort_student; self.assign(r,f'Escort {s.name}',95,f'escorting {s.name} to safety'); self.navigate(r,center((3,17)),88,dt,8); self.navigate(s,r.pos,94,dt,27)
+                x,y=cell(s.pos)
+                if SAFE[0]<=x<SAFE[0]+SAFE[2] and SAFE[1]<=y<SAFE[1]+SAFE[3] and (self.rescued_count < len(self.students)-1 or self.fuel >= self.fuel_required):s.state='Rescued';self.escort_student=None;self.stats['students_rescued']+=1;self.log(f'{s.name} evacuated. {self.rescued_count}/{len(self.students)} students safe.')
+            else:
+                fuels=[p for p in self.pickups if p.kind=='fuel' and p.discovered and not p.collected]
+                if self.rescued_count == len(self.students)-1 and self.fuel < self.fuel_required and fuels:
+                    p=min(fuels,key=lambda p:math.dist(r.pos,p.pos));self.assign(r,f'Collect {p.name}',85,'securing fuel for final evacuation');self.navigate(r,p.pos,88,dt,16)
+                    if math.dist(r.pos,p.pos)<20:self.collect(p,r)
+                    return
+                known=[s for s in self.students if s.state=='Waiting' and self.discovered[s.name]]
+                if not known:self.assign(r,'Await Scout Intel',52,'standing by for survivor location')
+                else:
+                    s=min(known,key=lambda s:math.dist(r.pos,s.pos)); self.assign(r,f'Rescue {s.name}',self.task_score(75,60,math.dist(r.pos,s.pos)),f'dispatched to {s.name}'); self.navigate(r,s.pos,88,dt,8)
+                    if math.dist(r.pos,s.pos)<42:s.state='Following';self.escort_student=s;self.log(f'{s.name}: contact established. Returning to Safe Zone.')
+        elif self.order=='Follow':self.assign(r,'Follow Commander',30,'following Commander');self.navigate(r,self.leader.pos,104,dt,45)
+        else:self.assign(r,'Hold Position',20,'holding position')
+    def medic_ai(self,dt):
+        m=self.medic; patients=[a for a in (self.leader,self.rescuer,self.defender,self.scout,*self.students) if a.alive and a.state!='Rescued' and a.hp<82]
+        kits=[p for p in self.pickups if p.kind=='medkit' and p.discovered and not p.collected]
+        if self.medkits==0 and kits:
+            pickup=min(kits,key=lambda p:math.dist(m.pos,p.pos));self.assign(m,f'Collect {pickup.name}',65,'restocking medical supplies');self.navigate(m,pickup.pos,100,dt,18)
+            if math.dist(m.pos,pickup.pos)<20:self.collect(pickup,m)
+            return
+        if patients and self.medkits:
+            p=min(patients,key=lambda a:a.hp); self.assign(m,f'Heal {p.name}',self.task_score(100-p.hp,48,math.dist(m.pos,p.pos)),f'treating {p.name}');self.navigate(m,p.pos,100,dt,28)
+            if math.dist(m.pos,p.pos)<32 and not m.cooldown:p.hp=min(100,p.hp+38);p.flash=.35;self.medkits-=1;self.stats['medkits_used']+=1;m.cooldown=3;self.log(f'Medic: {p.name} stabilized. {self.medkits} medkit(s) remain.')
+        else:self.assign(m,'Support Escort',self.task_score(10,30,math.dist(m.pos,self.rescuer.pos)),'supporting the escort');self.navigate(m,self.rescuer.pos,92,dt,55)
+    def defender_ai(self,dt):
+        d=self.defender; ammo_pickups=[p for p in self.pickups if p.kind=='ammo' and p.discovered and not p.collected]
+        if self.ammo<=2 and ammo_pickups:
+            p=min(ammo_pickups,key=lambda p:math.dist(d.pos,p.pos));self.assign(d,f'Collect {p.name}',70,'restocking ammunition');self.navigate(d,p.pos,112,dt,16)
+            if math.dist(d.pos,p.pos)<20:self.collect(p,d)
+            return
+        threats=[z for z in self.zombies if z.alive and self.discovered[z.name]]; people=[a for a in (self.leader,self.rescuer,self.scout,*self.students) if a.alive and a.state!='Rescued']
+        if threats:
+            z=min(threats,key=lambda z:math.dist(d.pos,z.pos)); p=min(people,key=lambda a:math.dist(z.pos,a.pos)); self.defender_target=z; self.assign(d,f'Protect {p.name}',self.task_score(80,55,math.dist(d.pos,z.pos)),f'intercepting {z.name} near {p.name}')
+            if math.dist(d.pos,z.pos)>39:self.navigate(d,z.pos,112,dt,28)
+            else:
+                d.state='Engage'
+                if not d.cooldown and self.ammo:z.hp=max(0,z.hp-14);self.ammo-=1;z.flash=.25;d.cooldown=.58;self.stats['zombies_neutralized']+=int(not z.alive);self.log(f'Defender: {z.name} neutralized.' if not z.alive else f'Defender: engaging {z.name}.')
+        else:self.assign(d,'Guard Escort',self.task_score(12,45,math.dist(d.pos,self.rescuer.pos)),'guarding the rescue team');self.navigate(d,self.rescuer.pos,96,dt,62)
+    def zombie_ai(self,z,dt,sprint):
+        if not z.alive or z.stun:return
+        # Waiting students are concealed in their classrooms. Once a Rescuer makes
+        # contact they become an exposed escort target, creating rescue risk
+        # without allowing an unseen patrol to end the mission immediately.
+        targets=[a for a in (self.leader,self.rescuer,*self.students) if a.alive and a.state!='Rescued' and (a.role != 'Student' or a.state == 'Following') and math.dist(z.pos,a.pos)<(245 if sprint and a is self.leader else 185) and self.visible(z.pos,a.pos)]
+        if self.defender.alive and self.defender_target is z and self.defender.state=='Engage' and math.dist(z.pos,self.defender.pos)<90:targets.append(self.defender)
+        if targets:
+            # An exposed escorted student is the highest-value target. This makes
+            # the rescue threat visible instead of silently redirecting attacks
+            # to a nearby Rescuer or Defender.
+            escorted=[a for a in targets if a.role=='Student' and a.state=='Following']
+            t=min(escorted,key=lambda a:math.dist(z.pos,a.pos)) if escorted else (self.defender if self.defender in targets else min(targets,key=lambda a:math.dist(z.pos,a.pos)));z.last_seen=t.pos;z.search_time=3
+            if math.dist(z.pos,t.pos)<27:
+                z.state='Attack'
+                if not z.cooldown:t.hp=max(0,t.hp-6);t.flash=.3;z.cooldown=.75
+            else:z.state='Chase';self.navigate(z,t.pos,76,dt,20)
+        elif z.last_seen:
+            z.state='Search';self.navigate(z,z.last_seen,66,dt);z.search_time-=dt
+            if z.search_time<=0:z.last_seen=None
+        else:
+            z.state='Patrol';pts=[(25,10),(25,2),(14,2),(14,10)];dest=center(pts[(z.patrol+self.zombies.index(z))%4]);self.navigate(z,dest,48,dt)
+            if math.dist(z.pos,dest)<6:z.patrol=(z.patrol+1)%4
+    def update(self,dt,movement=(0,0),sprint=False):
+        if self.result:return
+        dt=min(dt,.05);self.elapsed+=dt;self.time=max(0,self.time-dt);self.shove_cooldown=max(0,self.shove_cooldown-dt)
+        for a in self.actors:a.moving=False;a.flash=max(0,a.flash-dt);a.cooldown=max(0,a.cooldown-dt);a.stun=max(0,a.stun-dt)
+        dx,dy=movement;n=math.hypot(dx,dy)
+        if n and self.leader.alive:self.move(self.leader,dx/n*(158 if sprint else 112)*dt,dy/n*(158 if sprint else 112)*dt)
+        self.scout_ai(dt);self.rescuer_ai(dt);self.medic_ai(dt);self.defender_ai(dt)
+        for z in self.zombies:self.zombie_ai(z,dt,sprint)
+        if any(not s.alive for s in self.students):self.result='Student lost'
+        elif not self.leader.alive or not self.rescuer.alive:self.result='Rescue team lost'
+        elif self.time<=0:self.result='Time expired'
+        elif self.rescued_count==len(self.students):self.result='Mission complete';self.log('All students evacuated. Campus rescue successful!')
+        if self.result:self.save_stats()
