@@ -29,7 +29,8 @@ INK, MUTED, GREEN = (224, 235, 233), (143, 164, 166), (100, 231, 174)
 PANEL, PANEL_EDGE, ROAD, ROAD_EDGE = (18, 31, 38), (57, 83, 89), (58, 70, 73), (105, 124, 121)
 OX, OY = 20, 94
 campaign = load_progress()
-game = Game(campaign_level=campaign['unlocked_sector'])
+player_role = 'Commander'
+game = Game(campaign_level=campaign['unlocked_sector'], player_role=player_role)
 selected, paused, debug, full_map = True, False, False, False
 screen_state, difficulty = 'menu', 'Normal'
 adaptive_plan = recommend()
@@ -74,7 +75,7 @@ def play_sound(name):
 def start_campaign_mission():
     """Create the currently unlocked sector and apply optional difficulty aid."""
     global game, paused, mission_outcome_processed, campaign_notice, last_log_message
-    game = Game(campaign_level=campaign['unlocked_sector'])
+    game = Game(campaign_level=campaign['unlocked_sector'], player_role=player_role)
     manual_time = {'Easy': 60, 'Normal': 0, 'Hard': -60}[difficulty]
     game.time = max(150, game.time + manual_time + adaptive_plan['time'])
     game.medkits = max(1, game.medkits + adaptive_plan['medkits'])
@@ -89,7 +90,7 @@ def reset_campaign():
     """Clear saved sectors and prepare a fresh Sector 1 mission."""
     global campaign, game, campaign_notice, mission_outcome_processed
     campaign = reset_progress()
-    game = Game(campaign_level=1)
+    game = Game(campaign_level=1, player_role=player_role)
     campaign_notice, mission_outcome_processed = 'Campaign reset. Sector 1 is ready.', False
 
 
@@ -276,6 +277,9 @@ def draw_ambient_lights():
 
 def draw_actor(a):
     x, y = int(OX+a.x), int(OY+a.y)
+    if a is game.controlled_actor() and a.alive:
+        pygame.draw.circle(screen, (244, 195, 109), (x, y+5), 24, 2)
+        text('YOU', x-12, y-39, 12, (244, 195, 109))
     if not a.alive:
         body = pygame.transform.smoothscale(ACTOR_IMAGES[a.role], (36, 26))
         body.set_alpha(125)
@@ -480,6 +484,7 @@ def draw():
     text('CAMPUS / CRISIS', 22, 17, 32)
     text('FIRST RESPONSE     /     PLAYABLE PROTOTYPE 01', 24, 58, 12, MUTED)
     text(f'{game.rescued_count:02}/{len(game.students):02}  STUDENTS EXTRACTED', 555, 29, 16, GREEN)
+    text(f'YOU: {player_role.upper()}', 555, 51, 12, (244, 195, 109))
     text(f'{int(game.time)//60:02}:{int(game.time)%60:02}', 811, 22, 32, (243, 190, 119))
     rect((76, 101, 107) if audio_muted else (51, 92, 81), mute_button, 6)
     text('MUTED [M]' if audio_muted else 'SOUND ON [M]', 1061, 53, 12, INK)
@@ -499,17 +504,28 @@ def draw():
         rect(GREEN if a.hp > 35 else (237, 119, 110), (1040, y+5, int(a.hp), 8), 4)
     intel = 'STUDENT LOCATED' if game.discovered['Student'] else 'SCOUT SEARCHING FOR STUDENT'
     text(intel, 946, 327, 12, GREEN if game.discovered['Student'] else (244, 208, 104))
-    text('RESCUER SELECTED' if selected else 'SELECT RESCUER TO COMMAND', 946, 342, 12, (244, 195, 109))
-    for bounds, order, label in buttons:
-        rect((54, 100, 90) if game.order == order else (31, 46, 55), bounds, 5)
-        rect(GREEN if game.order == order else (52, 75, 80), bounds, 5, 1)
-        text(label, bounds.x+12, bounds.y+7, 14)
+    text('COMMAND PANEL' if player_role == 'Commander' else f'PLAYER CONTROLS: {player_role.upper()}', 946, 342, 12, (244, 195, 109))
+    if player_role == 'Commander':
+        for bounds, order, label in buttons:
+            rect((54, 100, 90) if game.order == order else (31, 46, 55), bounds, 5)
+            rect(GREEN if game.order == order else (52, 75, 80), bounds, 5, 1)
+            text(label, bounds.x+12, bounds.y+7, 14)
+    else:
+        action_help = {
+            'Rescuer': '[E] Start escort / collect nearby item',
+            'Medic': '[E] Treat nearby teammate / collect item',
+            'Defender': '[E] Engage zombie / collect ammo',
+            'Scout': '[E] Scan nearby sector / collect item',
+        }[player_role]
+        rect((31, 46, 55), (944, 370, 232, 72), 5)
+        text(action_help, 956, 385, 12, INK)
+        text('WASD move  |  Shift run', 956, 412, 12, MUTED)
     text('AI TASK ALLOCATION', 946, 513, 14, GREEN)
     text(f'Scout: {game.scout.task}  [{game.scout.task_score}]', 946, 535, 12, MUTED)
     text(f'Medic: {game.medic.task}  [{game.medic.task_score}]', 946, 553, 12, MUTED)
     text(f'Defender: {game.defender.task}  [{game.defender.task_score}]', 946, 571, 12, MUTED)
     text(f'Medkits: {game.medkits}  |  Ammo: {game.ammo}', 946, 589, 12, (126, 224, 195))
-    text(f'Fuel: {game.fuel}/{game.fuel_required} for final evacuation', 946, 604, 12, (70, 160, 215))
+    text(f'Fuel secured: {game.fuel}/{game.fuel_required}', 946, 604, 12, (70, 160, 215))
     active_targets = [f'{z.name} -> {z.target_name}' for z in game.zombies if z.target_name]
     text('THREAT: '+(', '.join(active_targets) if active_targets else 'No active pursuit'), 946, 619, 12, (244, 143, 133))
     text('FIELD COMMS', 946, 636, 14, GREEN)
@@ -524,7 +540,9 @@ def draw():
             current += word+' '
         text(current, 946, y, 12, MUTED)
         y += 26
-    text('WASD Move  |  Shift Run  |  Space Strike  |  E Rescue  |  Tab Select  |  F4 Full Map  |  P Pause  |  R Restart', 22, 742, 12, MUTED)
+    controls = ('WASD Move  |  Shift Run  |  Space Strike  |  E Rescue/Command  |  F4 Full Map  |  P Pause  |  R Restart'
+                if player_role == 'Commander' else 'WASD Move  |  Shift Run  |  E Context Action  |  F4 Full Map  |  P Pause  |  R Restart')
+    text(controls, 22, 742, 12, MUTED)
     if game.shove_cooldown > .4:
         pygame.draw.circle(screen, (221, 233, 202), (int(OX+game.leader.x), int(OY+game.leader.y)), 38, 2)
     if paused or game.result:
@@ -560,14 +578,30 @@ def draw_menu():
         text('CHOOSE DIFFICULTY', 319, 438, 14, MUTED)
         for index, label in enumerate(('Easy', 'Normal', 'Hard')):
             menu_button('difficulty_'+label, label+('  ✓' if difficulty == label else ''), (319+index*170, 463, 150, 38), difficulty == label)
-        menu_button('deploy', 'DEPLOY TEAM  [ENTER]', (319, 525, 330, 42), True)
+        menu_button('deploy', 'CHOOSE PLAYABLE ROLE  [ENTER]', (319, 525, 330, 42), True)
         menu_button('back', 'BACK  [ESC]', (664, 525, 180, 42))
         menu_button('reset_campaign', 'RESET CAMPAIGN  [X]', (319, 580, 330, 38))
+    elif screen_state == 'role_select':
+        text('CHOOSE YOUR ROLE', 319, 270, 24, GREEN)
+        text('You control this role. The rest of the rescue team uses AI decisions.', 319, 302, 14, MUTED)
+        roles = (
+            ('Commander', 'Coordinate the team and issue rescue orders.'),
+            ('Rescuer', 'Reach located students and escort them to safety.'),
+            ('Medic', 'Move to injured teammates and use medkits.'),
+            ('Defender', 'Protect the team and engage visible zombies.'),
+            ('Scout', 'Explore fog and scan nearby campus sectors.'),
+        )
+        for index, (role, description) in enumerate(roles):
+            y = 338 + index*43
+            active = player_role == role
+            menu_button('role_'+role, f'[{index+1}]  {role.upper()}  —  {description}', (319, y, 550, 35), active)
+        menu_button('launch_role', f'DEPLOY AS {player_role.upper()}  [ENTER]', (319, 565, 330, 42), True)
+        menu_button('back', 'BACK', (664, 565, 180, 42))
     else:
         text('HOW TO PLAY', 319, 290, 24, GREEN)
-        text('WASD moves the Commander. Press E to queue rescues.', 319, 332, 16, MUTED)
-        text('Scout explores; Medic heals; Defender intercepts zombies.', 319, 364, 16, MUTED)
-        text('Collect fuel before the final evacuation.', 319, 396, 16, MUTED)
+        text('Choose Commander or a field role before each mission.', 319, 332, 16, MUTED)
+        text('WASD moves your role. E performs its context action.', 319, 364, 16, MUTED)
+        text('Resources help the team, but every Safe Zone tile releases an escort.', 319, 396, 16, MUTED)
         menu_button('back', 'BACK TO MENU  [ESC]', (319, 515, 330, 48), True)
 
 
@@ -590,6 +624,10 @@ while running:
             elif screen_state == 'briefing' and event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
                 difficulty = {pygame.K_1: 'Easy', pygame.K_2: 'Normal', pygame.K_3: 'Hard'}[event.key]
             elif screen_state == 'briefing' and event.key == pygame.K_RETURN:
+                screen_state = 'role_select'
+            elif screen_state == 'role_select' and event.key in (pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4, pygame.K_5):
+                player_role = ('Commander', 'Rescuer', 'Medic', 'Defender', 'Scout')[event.key-pygame.K_1]
+            elif screen_state == 'role_select' and event.key == pygame.K_RETURN:
                 start_campaign_mission(); screen_state = 'game'
             elif screen_state == 'briefing' and event.key == pygame.K_x:
                 reset_campaign()
@@ -610,9 +648,12 @@ while running:
             elif event.key == pygame.K_TAB:
                 selected = not selected
             elif not paused:
-                if event.key == pygame.K_SPACE:
-                    game.shove()
-                elif selected and event.key in (pygame.K_e, pygame.K_f, pygame.K_h):
+                if event.key in (pygame.K_SPACE, pygame.K_e):
+                    if player_role == 'Commander':
+                        game.shove() if event.key == pygame.K_SPACE else game.command('Rescue')
+                    elif event.key == pygame.K_e:
+                        game.player_action()
+                elif player_role == 'Commander' and selected and event.key in (pygame.K_f, pygame.K_h):
                     game.command({pygame.K_e: 'Rescue', pygame.K_f: 'Follow', pygame.K_h: 'Hold'}[event.key])
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if screen_state != 'game':
@@ -622,9 +663,11 @@ while running:
                         elif key == 'howto': screen_state = 'howto'
                         elif key == 'quit': running = False
                         elif key == 'back': screen_state = 'menu'
-                        elif key == 'deploy': start_campaign_mission(); screen_state = 'game'
+                        elif key == 'deploy': screen_state = 'role_select'
+                        elif key == 'launch_role': start_campaign_mission(); screen_state = 'game'
                         elif key == 'reset_campaign': reset_campaign()
                         elif key.startswith('difficulty_'): difficulty = key.removeprefix('difficulty_')
+                        elif key.startswith('role_'): player_role = key.removeprefix('role_')
             elif not paused:
                 mx, my = event.pos
                 if mute_button.collidepoint(event.pos):
@@ -633,7 +676,7 @@ while running:
                 if math.dist((mx-OX, my-OY), game.rescuer.pos) < 28:
                     selected = True
                 for bounds, order, _ in buttons:
-                    if selected and bounds.collidepoint(event.pos):
+                    if player_role == 'Commander' and selected and bounds.collidepoint(event.pos):
                         game.command(order)
     keys = pygame.key.get_pressed()
     if screen_state == 'game' and not paused:

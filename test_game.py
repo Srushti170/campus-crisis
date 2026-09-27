@@ -1,6 +1,6 @@
 import unittest
 from adaptive import train
-from world import Game, WALLS, center, cell, pathfind
+from world import Game, WALLS, SAFE, center, cell, pathfind
 
 class MissionTests(unittest.TestCase):
     def test_ml_model_trains_after_fifteen_completed_missions(self):
@@ -27,6 +27,12 @@ class MissionTests(unittest.TestCase):
         self.assertEqual(len(game.pickups), 6)
         self.assertGreaterEqual(game.time, 270)
         self.assertEqual(game.rescued_count, 0)
+
+    def test_higher_sector_random_layouts_always_fit_all_students(self):
+        for seed in range(1, 81):
+            game = Game(seed=seed, campaign_level=3)
+            self.assertEqual(len(game.students), game.mission['students'])
+            self.assertEqual(len(game.zombies), game.mission['zombies'])
 
     def test_rescuer_waits_for_intel(self):
         game = Game(seed=7)
@@ -57,6 +63,17 @@ class MissionTests(unittest.TestCase):
         game.update(1/60)
         self.assertLess(game.zombie.hp, 100)
         self.assertEqual(game.defender.state, 'Engage')
+
+    def test_zombie_targets_player_defender_when_they_close_distance(self):
+        game = Game(seed=7, player_role='Defender')
+        for zombie in game.zombies[1:]:
+            zombie.hp = 0
+        game.zombie.x, game.zombie.y = game.defender.x + 20, game.defender.y
+        before = game.defender.hp
+        game.update(1 / 60)
+        self.assertEqual(game.zombie.target_name, game.defender.name)
+        self.assertEqual(game.zombie.state, 'Attack')
+        self.assertLess(game.defender.hp, before)
 
     def test_downed_defender_stays_in_place(self):
         game = Game(seed=7)
@@ -147,5 +164,99 @@ class MissionTests(unittest.TestCase):
             game.update(1 / 60)
 
         self.assertEqual(game.scout.task, 'Report to Commander')
+
+    def test_scout_keeps_searching_when_outdoor_fog_remains(self):
+        game = Game(seed=7)
+        for zombie in game.zombies:
+            zombie.hp = 0
+        game.revealed.update((x, y) for y in range(20) for x in range(28))
+        # This road tile is a valid unsearched campus route, not a building.
+        game.revealed.discard((2, 5))
+        game.update(1 / 60)
+        self.assertNotEqual(game.scout.task, 'Report to Commander')
+
+    def test_player_controlled_rescuer_moves_without_rescuer_ai(self):
+        game = Game(seed=7, player_role='Rescuer')
+        before = game.rescuer.pos
+        game.update(1 / 30, movement=(1, 0))
+        self.assertGreater(game.rescuer.x, before[0])
+        self.assertNotEqual(game.rescuer.task, 'Follow Commander')
+
+    def test_player_rescuer_can_begin_a_discovered_escort(self):
+        game = Game(seed=7, player_role='Rescuer')
+        student = game.student
+        game.discovered[student.name] = True
+        game.rescuer.x, game.rescuer.y = student.x - 20, student.y
+        game.player_action()
+        self.assertEqual(student.state, 'Following')
+        self.assertIs(game.escort_student, student)
+
+    def test_player_medic_treats_nearby_injured_teammate(self):
+        game = Game(seed=7, player_role='Medic')
+        game.leader.hp = 35
+        game.medic.x, game.medic.y = game.leader.x + 20, game.leader.y
+        before_kits = game.medkits
+        game.player_action()
+        self.assertGreater(game.leader.hp, 35)
+        self.assertEqual(game.medkits, before_kits - 1)
+
+    def test_player_defender_attack_sets_active_threat(self):
+        game = Game(seed=7, player_role='Defender')
+        game.zombie.x, game.zombie.y = game.defender.x + 40, game.defender.y
+        before_hp = game.zombie.hp
+        game.player_action()
+        self.assertLess(game.zombie.hp, before_hp)
+        self.assertIs(game.defender_target, game.zombie)
+
+    def test_player_scout_scan_discovers_visible_student(self):
+        game = Game(seed=7, player_role='Scout')
+        for zombie in game.zombies:
+            zombie.hp = 0
+        game.student.x, game.student.y = center((24, 4))
+        game.scout.x, game.scout.y = center((25, 8))
+        game.player_action()
+        self.assertTrue(game.discovered['Student-1'])
+
+    def test_player_scout_reveals_fog_while_moving(self):
+        game = Game(seed=7, player_role='Scout')
+        before = set(game.revealed)
+        game.update(1 / 20, movement=(1, 0))
+        self.assertGreater(len(game.revealed), len(before))
+
+    def test_field_role_mission_keeps_ai_team_on_rescue_tasks(self):
+        game = Game(seed=7, player_role='Scout')
+        for zombie in game.zombies:
+            zombie.hp = 0
+        game.student.x, game.student.y = center((24, 4))
+        game.scout.x, game.scout.y = center((25, 8))
+        game.update(1 / 30)
+        self.assertEqual(game.order, 'Rescue')
+        self.assertTrue(game.discovered['Student-1'])
+        self.assertIn('Rescue', game.rescuer.task)
+        self.assertEqual(game.leader.task, 'Coordinate Team')
+
+    def test_player_rescuer_evacuates_last_escort_anywhere_in_safe_zone(self):
+        corners = ((SAFE[0], SAFE[1]), (SAFE[0]+SAFE[2]-1, SAFE[1]),
+                   (SAFE[0], SAFE[1]+SAFE[3]-1), (SAFE[0]+SAFE[2]-1, SAFE[1]+SAFE[3]-1))
+        for safe_tile in corners:
+            game = Game(seed=7, player_role='Rescuer')
+            student = game.student
+            student.state = 'Following'
+            game.escort_student = student
+            game.fuel = 0
+            game.rescuer.x, game.rescuer.y = center(safe_tile)
+            student.x, student.y = game.rescuer.x + 42, game.rescuer.y
+            game.player_rescuer_update(0)
+            self.assertEqual(student.state, 'Rescued')
+            self.assertIsNone(game.escort_student)
+
+    def test_field_team_stages_instead_of_trailing_player_rescuer(self):
+        game = Game(seed=7, player_role='Rescuer')
+        for zombie in game.zombies:
+            zombie.hp = 0
+        game.update(1 / 30)
+        self.assertEqual(game.leader.task, 'Coordinate Team')
+        self.assertEqual(game.medic.task, 'Stage at Clinic')
+        self.assertEqual(game.defender.task, 'Guard Safe Zone')
 
 if __name__ == '__main__': unittest.main()
