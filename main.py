@@ -14,8 +14,9 @@ if args.smoke_test or args.screenshot:
     os.environ['SDL_VIDEODRIVER'] = 'dummy'
     os.environ['SDL_AUDIODRIVER'] = 'dummy'
 import pygame
-from world import Game, TILE, COLS, ROWS, BUILDINGS, SAFE, LANDMARKS, center
+from world import Game, TILE, COLS, ROWS, BUILDINGS, SAFE, LANDMARKS, center, walkable
 from adaptive import recommend, report
+from campaign import load_progress, record_completion, reset_progress
 
 pygame.mixer.pre_init(44100, -16, 1, 512)
 pygame.init()
@@ -25,19 +26,24 @@ pygame.display.set_caption('Campus Crisis | First Response')
 clock = pygame.time.Clock()
 fonts = {size: pygame.font.SysFont('segoeui', size, bold=size >= 24) for size in (12, 13, 14, 16, 18, 24, 32, 48)}
 INK, MUTED, GREEN = (224, 235, 233), (143, 164, 166), (100, 231, 174)
+PANEL, PANEL_EDGE, ROAD, ROAD_EDGE = (18, 31, 38), (57, 83, 89), (58, 70, 73), (105, 124, 121)
 OX, OY = 20, 94
-game = Game()
-selected, paused, debug = True, False, False
+campaign = load_progress()
+game = Game(campaign_level=campaign['unlocked_sector'])
+selected, paused, debug, full_map = True, False, False, False
 screen_state, difficulty = 'menu', 'Normal'
 adaptive_plan = recommend()
 adaptive_data = report()
 menu_buttons = {}
 last_log_message = ''
 audio_muted = False
+campaign_notice = ''
+mission_outcome_processed = False
 mute_button = pygame.Rect(1052, 45, 130, 32)
 if args.preview_game:
     screen_state = 'game'
 ASSET_ROOT = Path(__file__).parent / 'assets' / 'kenney-top-down-shooter'
+REALISTIC_MAP_PATH = Path(__file__).parent / 'assets' / 'generated' / 'campus-game-map-v4.png'
 
 
 def load_asset(relative_path, size=None):
@@ -65,7 +71,31 @@ def play_sound(name):
         SOUNDS[name].play()
 
 
+def start_campaign_mission():
+    """Create the currently unlocked sector and apply optional difficulty aid."""
+    global game, paused, mission_outcome_processed, campaign_notice, last_log_message
+    game = Game(campaign_level=campaign['unlocked_sector'])
+    manual_time = {'Easy': 60, 'Normal': 0, 'Hard': -60}[difficulty]
+    game.time = max(150, game.time + manual_time + adaptive_plan['time'])
+    game.medkits = max(1, game.medkits + adaptive_plan['medkits'])
+    for zombie in game.zombies:
+        zombie.hp = max(30, zombie.hp + adaptive_plan['zombie_hp'])
+    game.log(f"Sector {game.campaign_level}: adaptive setting {adaptive_plan['label']}.")
+    last_log_message = game.logs[-1]
+    paused, mission_outcome_processed, campaign_notice = False, False, ''
+
+
+def reset_campaign():
+    """Clear saved sectors and prepare a fresh Sector 1 mission."""
+    global campaign, game, campaign_notice, mission_outcome_processed
+    campaign = reset_progress()
+    game = Game(campaign_level=1)
+    campaign_notice, mission_outcome_processed = 'Campaign reset. Sector 1 is ready.', False
+
+
 GRASS = load_asset('PNG/Tiles/tile_01.png', (TILE, TILE))
+REALISTIC_CAMPUS = (pygame.transform.smoothscale(pygame.image.load(REALISTIC_MAP_PATH).convert(), (COLS*TILE, ROWS*TILE))
+                    if REALISTIC_MAP_PATH.exists() else None)
 ACTOR_IMAGES = {
     'Leader': load_asset('PNG/Man Blue/manBlue_stand.png'),
     'Rescuer': load_asset('PNG/Soldier 1/soldier1_hold.png'),
@@ -98,15 +128,43 @@ def menu_button(key, label, bounds, accent=False):
 
 
 def draw_map():
-    rect((35, 62, 53), (OX, OY, COLS * TILE, ROWS * TILE), 8)
+    if REALISTIC_CAMPUS:
+        screen.blit(REALISTIC_CAMPUS, (OX, OY))
+        for label, tile, width in (('ADMIN BLOCK',(2,2),116),('LIBRARY',(15,2),92),('PARKING',(22,2),88),
+                                   ('SECURITY',(24,6),88),('SCIENCE LAB',(2,8),104),('LECTURE HALL',(16,8),112),
+                                   ('HOSTEL',(2,14),82),('CAFETERIA',(13,14),96),('SPORTS COURT',(22,14),110)):
+            x, y = OX+tile[0]*TILE, OY+tile[1]*TILE
+            tag = pygame.Surface((width, 24), pygame.SRCALPHA)
+            tag.fill((12, 25, 31, 210))
+            screen.blit(tag, (x, y))
+            text(label, x+8, y+5, 12, (229, 239, 234))
+        # The generated environment is decorative; this overlay keeps the
+        # playable extraction point unambiguous above the realistic art.
+        sx, sy, sw, sh = SAFE
+        safe = pygame.Rect(OX+sx*TILE, OY+sy*TILE, sw*TILE, sh*TILE)
+        safe_overlay = pygame.Surface(safe.size, pygame.SRCALPHA)
+        safe_overlay.fill((35, 142, 104, 105))
+        screen.blit(safe_overlay, safe)
+        rect((111, 238, 186), safe, 7, 2)
+        text('SAFE ZONE', safe.x+16, safe.y+10, 16, (177, 246, 209))
+        text('EVAC', safe.x+10, safe.bottom-22, 12, (177, 246, 209))
+        return
+    rect((20, 43, 40), (OX, OY, COLS * TILE, ROWS * TILE), 8)
     for y in range(ROWS):
         for x in range(COLS):
             screen.blit(GRASS, (OX + x*TILE, OY + y*TILE))
+    # A muted night wash makes the campus feel like an emergency scene rather
+    # than a bright board-game map, while leaving landmarks readable.
+    night_wash = pygame.Surface((COLS*TILE, ROWS*TILE), pygame.SRCALPHA)
+    night_wash.fill((7, 22, 27, 72))
+    screen.blit(night_wash, (OX, OY))
     for bounds in [(0, 9, 28, 2), (12, 0, 3, 20), (24, 0, 3, 20), (1, 0, 3, 20)]:
         x, y, w, h = bounds
-        rect((65, 78, 78), (OX+x*TILE, OY+y*TILE, w*TILE, h*TILE))
+        road = pygame.Rect(OX+x*TILE, OY+y*TILE, w*TILE, h*TILE)
+        rect(ROAD_EDGE, road, 0)
+        rect(ROAD, road.inflate(-6, -6), 0)
     for x in range(10, COLS*TILE, 42):
-        rect((130, 142, 128), (OX+x, OY+10*TILE-2, 18, 3))
+        rect((175, 187, 166), (OX+x, OY+10*TILE-2, 18, 3))
     sx, sy, sw, sh = SAFE
     safe = pygame.Rect(OX+sx*TILE, OY+sy*TILE, sw*TILE, sh*TILE)
     rect((33, 104, 81), safe, 6)
@@ -128,16 +186,21 @@ def draw_map():
     text('EVAC', safe.x+12, safe.y+93, 12, GREEN)
     for i, (x, y, w, h, label) in enumerate(BUILDINGS):
         box = pygame.Rect(OX+x*TILE, OY+y*TILE, w*TILE, h*TILE)
-        rect((23, 39, 36), box.move(7, 9), 5)
-        rect((116, 134, 134), box, 4)
-        rect((63, 84, 89) if i % 2 == 0 else (91, 86, 81), box.inflate(-12, -12), 3)
+        rect((9, 19, 22), box.move(7, 10), 5)
+        rect((79, 101, 105), box, 4)
+        rect((45, 61, 67) if i % 2 == 0 else (67, 64, 61), box.inflate(-12, -12), 3)
         for wx in range(box.x+17, box.right-15, 34):
             rect((114, 180, 183), (wx, box.y+16, 21, 13), 2)
             rect((114, 180, 183), (wx, box.bottom-29, 21, 13), 2)
-        rect((46, 60, 64), (box.x+18, box.y+50, w*TILE-36, 44), 3)
-        text(label, box.x+27, box.y+61, 14)
+        compact = box.height < 110
+        header_y, header_h = box.y + (18 if compact else 50), (24 if compact else 35)
+        rect((22, 34, 39), (box.x+12, header_y, box.width-24, header_h), 3)
+        text(label, box.x+18, header_y+5, 12 if compact else 14, (211, 224, 219))
         interior = pygame.Rect(box.x+22, box.y+102, box.width-44, box.height-126)
-        if label == 'LIBRARY':
+        if label == 'ADMIN BLOCK':
+            for wx in range(box.x+18, box.right-12, 22):
+                rect((121, 178, 190), (wx, box.y+36, 12, 10), 1)
+        elif label == 'LIBRARY':
             for shelf_x in range(interior.x, interior.right, 32):
                 rect((113, 73, 43), (shelf_x, interior.y, 20, interior.height), 2)
                 for book_y in range(interior.y+4, interior.bottom, 10):
@@ -151,6 +214,15 @@ def draw_map():
             for row in range(2):
                 for desk_x in range(interior.x, interior.right, 30):
                     rect((170, 123, 70), (desk_x, interior.y+row*19, 21, 11), 2)
+        elif label == 'HOSTEL':
+            for door_x in range(box.x+18, box.right-15, 28):
+                rect((107, 74, 58), (door_x, box.y+50, 18, 28), 2)
+                rect((224, 184, 91), (door_x+12, box.y+64, 3, 3), 1)
+        elif label == 'SPORTS COURT':
+            court = pygame.Rect(box.x+14, box.y+48, box.width-28, max(18, box.height-62))
+            rect((62, 113, 104), court, 2)
+            rect((213, 227, 207), court, 2, 1)
+            pygame.draw.line(screen, (213, 227, 207), (court.centerx, court.y+2), (court.centerx, court.bottom-2), 1)
         else:
             for table_x in range(interior.x+8, interior.right, 50):
                 pygame.draw.circle(screen, (211, 188, 143), (table_x, interior.y+14), 12)
@@ -193,13 +265,23 @@ def draw_map():
     text('EAST CAMPUS', OX+750, OY+18, 12, (180, 192, 173))
 
 
+def draw_ambient_lights():
+    """Subtle pools of campus light keep important areas readable at night."""
+    lights = pygame.Surface((COLS*TILE, ROWS*TILE), pygame.SRCALPHA)
+    for x, y, radius, color in ((3, 17, 82, (76, 226, 170, 34)), (3, 13, 56, (226, 92, 86, 24)),
+                                (26, 4, 52, (231, 181, 81, 24)), (14, 18, 54, (74, 161, 220, 28))):
+        pygame.draw.circle(lights, color, (int(x*TILE+TILE/2), int(y*TILE+TILE/2)), radius)
+    screen.blit(lights, (OX, OY))
+
+
 def draw_actor(a):
     x, y = int(OX+a.x), int(OY+a.y)
     if not a.alive:
         body = pygame.transform.smoothscale(ACTOR_IMAGES[a.role], (36, 26))
         body.set_alpha(125)
         screen.blit(body, body.get_rect(center=(x, y+5)))
-        text('DOWN', x-18, y+10, 12, (233, 134, 131))
+        pygame.draw.line(screen, (229, 87, 82), (x-16, y-9), (x+16, y+12), 2)
+        text('DOWN', x-18, y+12, 12, (233, 134, 131))
         return
     colors = {'Leader': (76, 162, 221), 'Rescuer': (232, 168, 75),
               'Medic': (108, 224, 193), 'Defender': (239, 119, 94),
@@ -207,6 +289,11 @@ def draw_actor(a):
               'Student': (174, 140, 224), 'Zombie': (138, 171, 90)}
     color = colors[a.role]
     pygame.draw.ellipse(screen, (23, 37, 34), (x-13, y+4, 26, 13))
+    if a.moving:
+        # Small dust puffs communicate movement without changing the stable
+        # sprite orientation used by the Scout.
+        pygame.draw.circle(screen, (119, 130, 112), (x-10, y+10), 2)
+        pygame.draw.circle(screen, (119, 130, 112), (x+9, y+11), 2)
     if a.role == 'Rescuer' and selected:
         pygame.draw.circle(screen, (245, 201, 120), (x, y), 21, 2)
     # The source Scout art is asymmetrical; rotating it at tiny steering changes
@@ -239,10 +326,12 @@ buttons = [(pygame.Rect(944, 370+i*43, 232, 35), order, label)
 
 def draw_fog():
     fog = pygame.Surface((TILE, TILE), pygame.SRCALPHA)
-    fog.fill((7, 14, 19, 210))
+    fog.fill((5, 13, 20, 125 if REALISTIC_CAMPUS else 188))
     for y in range(ROWS):
         for x in range(COLS):
-            if (x, y) not in game.revealed:
+            # The fenced perimeter and building interiors are not searchable
+            # terrain, so they should never look like unexplored campus fog.
+            if walkable((x, y)) and (x, y) not in game.revealed:
                 screen.blit(fog, (OX + x*TILE, OY + y*TILE))
 
 
@@ -286,9 +375,106 @@ def draw_threat_markers():
         text('ZOMBIE TARGET', x-38, y-47, 12, (250, 148, 136))
 
 
+def draw_action_effects():
+    """Short, role-specific cues that make autonomous actions readable."""
+    actors = {actor.name: actor for actor in game.actors}
+    pulse = int((math.sin(game.elapsed * 12) + 1) * 2)
+    # A short amber tracer makes the Defender's shots visible without clutter.
+    defender, target = game.defender, game.defender_target
+    if defender.state == 'Engage' and defender.cooldown > .35 and target and target.alive:
+        start = (int(OX + defender.x), int(OY + defender.y - 6))
+        end = (int(OX + target.x), int(OY + target.y))
+        pygame.draw.line(screen, (248, 211, 112), start, end, 2)
+        pygame.draw.circle(screen, (255, 235, 168), start, 5 + pulse)
+    # Healing is visible as a calm medical ring around the current patient.
+    if game.medic.task.startswith('Heal '):
+        patient = actors.get(game.medic.task.removeprefix('Heal '))
+        if patient and patient.alive and math.dist(game.medic.pos, patient.pos) < 45:
+            x, y = int(OX + patient.x), int(OY + patient.y)
+            pygame.draw.circle(screen, (103, 235, 194), (x, y), 24 + pulse, 2)
+            text('+', x-4, y-44, 18, (151, 248, 214))
+    # An escort tether explains who is being extracted without adding a panel.
+    if game.escort_student and game.escort_student.alive:
+        student, rescuer = game.escort_student, game.rescuer
+        start, end = (int(OX + rescuer.x), int(OY + rescuer.y)), (int(OX + student.x), int(OY + student.y))
+        pygame.draw.line(screen, (244, 197, 112), start, end, 1)
+        pygame.draw.circle(screen, (244, 197, 112), end, 23 + pulse, 2)
+    # Bite arcs show that a zombie is actively dealing damage, not merely close.
+    for zombie in game.zombies:
+        target = actors.get(zombie.target_name)
+        if zombie.alive and zombie.state == 'Attack' and target and target.alive:
+            x, y = int(OX + target.x), int(OY + target.y)
+            pygame.draw.arc(screen, (240, 89, 84), (x-28, y-28, 56, 56), .3, 2.8, 3)
+    # A pickup leaves a quick collection pulse after it disappears.
+    for pickup in game.pickups:
+        if pickup.pulse > 0:
+            x, y = int(OX + pickup.x), int(OY + pickup.y)
+            radius = 12 + int((.45-pickup.pulse) * 45)
+            pygame.draw.circle(screen, (121, 226, 196), (x, y), radius, 2)
+
+
+def draw_world():
+    """Render the campus layer; reused by normal and full-map views."""
+    draw_map()
+    if debug:
+        for role, route in game.routes.items():
+            points = [(OX+center(p)[0], OY+center(p)[1]) for p in route]
+            if len(points) > 1:
+                pygame.draw.lines(screen, (220, 121, 101) if role == 'Zombie' else (103, 211, 224), False, points, 2)
+    draw_ambient_lights()
+    draw_fog()
+    for pickup in game.pickups:
+        draw_pickup(pickup)
+    visible_actors = [a for a in game.actors if a.role not in ('Student', 'Zombie') or game.discovered[a.name]]
+    draw_threat_markers()
+    draw_action_effects()
+    for actor in sorted(visible_actors, key=lambda actor: actor.y):
+        draw_actor(actor)
+
+
+def draw_full_map():
+    """Use the whole screen for the rescue area without changing simulation coordinates."""
+    global screen, OX, OY
+    display, old_ox, old_oy = screen, OX, OY
+    campus = pygame.Surface((COLS*TILE, ROWS*TILE))
+    screen, OX, OY = campus, 0, 0
+    draw_world()
+    screen, OX, OY = display, old_ox, old_oy
+    scale = min(WIDTH/(COLS*TILE), HEIGHT/(ROWS*TILE))
+    size = (int(COLS*TILE*scale), int(ROWS*TILE*scale))
+    left, top = (WIDTH-size[0])//2, (HEIGHT-size[1])//2
+    display.fill((9, 18, 23))
+    display.blit(pygame.transform.smoothscale(campus, size), (left, top))
+    overlay = pygame.Surface((WIDTH, 64), pygame.SRCALPHA)
+    overlay.fill((8, 17, 23, 206)); display.blit(overlay, (0, 0))
+    text('CAMPUS / CRISIS', 22, 14, 24)
+    text(game.mission['title'].upper()+'  |  '+game.mission['objective'], 22, 43, 12, MUTED)
+    text(f'{game.rescued_count:02}/{len(game.students):02} STUDENTS  •  {int(game.time)//60:02}:{int(game.time)%60:02}', 805, 22, 16, GREEN)
+    text('[F4] COMMAND PANEL', 1015, 45, 12, MUTED)
+
+
+def draw_state_overlay():
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    overlay.fill((8, 17, 23, 200)); screen.blit(overlay, (0, 0))
+    rect((28, 45, 51), (300, 257, 600, 220), 14)
+    title = game.result or 'Mission paused'
+    text(title.upper(), 338, 290, 32, GREEN if title == 'Mission complete' else INK)
+    report = f"Rescued: {game.rescued_count}/{len(game.students)}   Kills: {game.stats['zombies_neutralized']}   Medkits used: {game.stats['medkits_used']}"
+    text(report, 338, 348, 16, MUTED)
+    text(f"Fuel: {game.fuel}/{game.fuel_required}   Ammo left: {game.ammo}   Time left: {int(game.time)}s", 338, 378, 16, MUTED)
+    if campaign_notice:
+        text(campaign_notice, 338, 405, 14, GREEN if game.result == 'Mission complete' else (244, 195, 109))
+    text('R  Start next rescue  |  X Reset campaign  |  Esc Quit' if game.result else 'P Resume  |  R Restart  |  Esc Quit', 338, 438, 16)
+
+
 def draw():
     if screen_state != 'game':
         draw_menu()
+        return
+    if full_map:
+        draw_full_map()
+        if paused or game.result:
+            draw_state_overlay()
         return
     screen.fill((16, 26, 32))
     text('CAMPUS / CRISIS', 22, 17, 32)
@@ -296,26 +482,18 @@ def draw():
     text(f'{game.rescued_count:02}/{len(game.students):02}  STUDENTS EXTRACTED', 555, 29, 16, GREEN)
     text(f'{int(game.time)//60:02}:{int(game.time)%60:02}', 811, 22, 32, (243, 190, 119))
     rect((76, 101, 107) if audio_muted else (51, 92, 81), mute_button, 6)
-    text('🔇 MUTED' if audio_muted else '🔊 SOUND ON', 1061, 53, 12, INK)
-    draw_map()
-    if debug:
-        for role, route in game.routes.items():
-            points = [(OX+center(p)[0], OY+center(p)[1]) for p in route]
-            if len(points) > 1:
-                pygame.draw.lines(screen, (220, 121, 101) if role == 'Zombie' else (103, 211, 224), False, points, 2)
-    draw_fog()
-    for pickup in game.pickups:
-        draw_pickup(pickup)
-    visible_actors = [a for a in game.actors if a.role not in ('Student', 'Zombie') or game.discovered[a.name]]
-    draw_threat_markers()
-    for a in sorted(visible_actors, key=lambda a: a.y):
-        draw_actor(a)
-    rect((24, 38, 45), (932, 94, 256, 640), 8)
-    text('MISSION CONTROL', 946, 110, 18)
-    text('Extract the stranded student.', 946, 140, 14, MUTED)
-    text('AI agents coordinate the rescue.', 946, 162, 14, MUTED)
+    text('MUTED [M]' if audio_muted else 'SOUND ON [M]', 1061, 53, 12, INK)
+    draw_world()
+    rect(PANEL, (932, 94, 256, 640), 8)
+    rect(PANEL_EDGE, (932, 94, 256, 640), 8, 1)
+    rect((29, 54, 58), (932, 94, 256, 48), 8)
+    text('MISSION CONTROL', 946, 110, 18, (220, 235, 230))
+    text(f"SECTOR {game.campaign_level}  /  3", 946, 140, 12, (244, 195, 109))
+    text(game.mission['title'].upper(), 946, 157, 14, GREEN)
+    text(game.mission['objective'], 946, 175, 12, MUTED)
+    text(f"{len(game.students)} students  |  {len(game.zombies)} zombies  |  {int(game.time)} sec", 946, 191, 12, MUTED)
     for i, a in enumerate((game.leader, game.rescuer, game.medic, game.defender, game.scout, game.student)):
-        y = 185+i*23
+        y = 208+i*21
         text(a.role, 946, y, 14)
         rect((46, 60, 63), (1040, y+5, 100, 8), 4)
         rect(GREEN if a.hp > 35 else (237, 119, 110), (1040, y+5, int(a.hp), 8), 4)
@@ -323,7 +501,8 @@ def draw():
     text(intel, 946, 327, 12, GREEN if game.discovered['Student'] else (244, 208, 104))
     text('RESCUER SELECTED' if selected else 'SELECT RESCUER TO COMMAND', 946, 342, 12, (244, 195, 109))
     for bounds, order, label in buttons:
-        rect((60, 87, 87) if game.order == order else (36, 52, 61), bounds, 5)
+        rect((54, 100, 90) if game.order == order else (31, 46, 55), bounds, 5)
+        rect(GREEN if game.order == order else (52, 75, 80), bounds, 5, 1)
         text(label, bounds.x+12, bounds.y+7, 14)
     text('AI TASK ALLOCATION', 946, 513, 14, GREEN)
     text(f'Scout: {game.scout.task}  [{game.scout.task_score}]', 946, 535, 12, MUTED)
@@ -345,20 +524,11 @@ def draw():
             current += word+' '
         text(current, 946, y, 12, MUTED)
         y += 26
-    text('WASD Move  |  Shift Run  |  Space Strike  |  E Rescue  |  Tab Select  |  P Pause  |  F3 AI paths  |  R Restart', 22, 742, 12, MUTED)
+    text('WASD Move  |  Shift Run  |  Space Strike  |  E Rescue  |  Tab Select  |  F4 Full Map  |  P Pause  |  R Restart', 22, 742, 12, MUTED)
     if game.shove_cooldown > .4:
         pygame.draw.circle(screen, (221, 233, 202), (int(OX+game.leader.x), int(OY+game.leader.y)), 38, 2)
     if paused or game.result:
-        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        overlay.fill((8, 17, 23, 200))
-        screen.blit(overlay, (0, 0))
-        rect((28, 45, 51), (300, 257, 600, 220), 14)
-        title = game.result or 'Mission paused'
-        text(title.upper(), 338, 290, 32, GREEN if title == 'Mission complete' else INK)
-        report = f"Rescued: {game.rescued_count}/{len(game.students)}   Kills: {game.stats['zombies_neutralized']}   Medkits used: {game.stats['medkits_used']}"
-        text(report, 338, 348, 16, MUTED)
-        text(f"Fuel: {game.fuel}/{game.fuel_required}   Ammo left: {game.ammo}   Time left: {int(game.time)}s", 338, 378, 16, MUTED)
-        text('R  Restart mission     |     Esc  Quit' if game.result else 'P  Resume     |     R  Restart     |     Esc  Quit', 338, 430, 16)
+        draw_state_overlay()
 
 
 def draw_menu():
@@ -379,18 +549,20 @@ def draw_menu():
         menu_button('quit', 'QUIT  [ESC]', (355, 470, 490, 44))
     elif screen_state == 'briefing':
         text('MISSION BRIEFING', 319, 290, 24, GREEN)
+        text(f"CAMPAIGN: Sector {campaign['unlocked_sector']} / 3   |   Successful rescues: {campaign['completed']}", 319, 315, 13, (244, 195, 109))
         model_status = (f"ML MODEL: trained on {adaptive_data['missions']} missions  |  Training fit: {adaptive_data['accuracy']:.0%}"
                         if adaptive_data['trained'] else f"ML MODEL: collecting data ({adaptive_data['missions']}/15 missions)")
-        text(model_status, 319, 328, 13, MUTED)
-        text('ADAPTIVE: '+adaptive_plan['label']+' — '+adaptive_plan['reason'], 319, 353, 12, GREEN)
+        text(model_status, 319, 340, 13, MUTED)
+        text('ADAPTIVE: '+adaptive_plan['label']+' — '+adaptive_plan['reason'], 319, 365, 12, GREEN)
         base_time = {'Easy': 300, 'Normal': 240, 'Hard': 180}[difficulty]
-        text(f"NEXT MISSION: Timer {base_time}s → {base_time + adaptive_plan['time']}s   |   Medkits 3 → {max(1, 3 + adaptive_plan['medkits'])}   |   Zombie HP 100 → {100 + adaptive_plan['zombie_hp']}", 319, 379, 12, INK)
-        text('Find and evacuate all three students. Fuel powers the final evacuation.', 319, 405, 14, MUTED)
-        text('CHOOSE DIFFICULTY', 319, 428, 14, MUTED)
+        text(f"PLAYER SETTING: {difficulty}   |   ML adjustment: {adaptive_plan['label']}", 319, 391, 12, INK)
+        text('Each campus incident varies its students, zombies, resources, objective, and time limit.', 319, 415, 14, MUTED)
+        text('CHOOSE DIFFICULTY', 319, 438, 14, MUTED)
         for index, label in enumerate(('Easy', 'Normal', 'Hard')):
-            menu_button('difficulty_'+label, label+('  ✓' if difficulty == label else ''), (319+index*170, 453, 150, 38), difficulty == label)
-        menu_button('deploy', 'DEPLOY TEAM  [ENTER]', (319, 515, 330, 42), True)
-        menu_button('back', 'BACK  [ESC]', (664, 515, 180, 42))
+            menu_button('difficulty_'+label, label+('  ✓' if difficulty == label else ''), (319+index*170, 463, 150, 38), difficulty == label)
+        menu_button('deploy', 'DEPLOY TEAM  [ENTER]', (319, 525, 330, 42), True)
+        menu_button('back', 'BACK  [ESC]', (664, 525, 180, 42))
+        menu_button('reset_campaign', 'RESET CAMPAIGN  [X]', (319, 580, 330, 38))
     else:
         text('HOW TO PLAY', 319, 290, 24, GREEN)
         text('WASD moves the Commander. Press E to queue rescues.', 319, 332, 16, MUTED)
@@ -418,17 +590,23 @@ while running:
             elif screen_state == 'briefing' and event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
                 difficulty = {pygame.K_1: 'Easy', pygame.K_2: 'Normal', pygame.K_3: 'Hard'}[event.key]
             elif screen_state == 'briefing' and event.key == pygame.K_RETURN:
-                game = Game(); game.time = {'Easy': 300, 'Normal': 240, 'Hard': 180}[difficulty] + adaptive_plan['time']; game.medkits = max(1, game.medkits + adaptive_plan['medkits']); [setattr(zombie, 'hp', max(30, zombie.hp + adaptive_plan['zombie_hp'])) for zombie in game.zombies]; game.log('Adaptive setting: '+adaptive_plan['label']+'.'); last_log_message = game.logs[-1]; screen_state = 'game'
+                start_campaign_mission(); screen_state = 'game'
+            elif screen_state == 'briefing' and event.key == pygame.K_x:
+                reset_campaign()
             elif screen_state != 'game':
                 continue
             elif event.key == pygame.K_m:
                 audio_muted = not audio_muted
             elif event.key == pygame.K_r:
-                game, paused = Game(), False
+                start_campaign_mission()
+            elif event.key == pygame.K_x and game.result:
+                reset_campaign(); screen_state = 'menu'
             elif event.key == pygame.K_p:
                 paused = not paused
             elif event.key == pygame.K_F3:
                 debug = not debug
+            elif event.key == pygame.K_F4:
+                full_map = not full_map
             elif event.key == pygame.K_TAB:
                 selected = not selected
             elif not paused:
@@ -444,7 +622,8 @@ while running:
                         elif key == 'howto': screen_state = 'howto'
                         elif key == 'quit': running = False
                         elif key == 'back': screen_state = 'menu'
-                        elif key == 'deploy': game = Game(); game.time = {'Easy': 300, 'Normal': 240, 'Hard': 180}[difficulty] + adaptive_plan['time']; game.medkits = max(1, game.medkits + adaptive_plan['medkits']); [setattr(zombie, 'hp', max(30, zombie.hp + adaptive_plan['zombie_hp'])) for zombie in game.zombies]; game.log('Adaptive setting: '+adaptive_plan['label']+'.'); last_log_message = game.logs[-1]; screen_state = 'game'
+                        elif key == 'deploy': start_campaign_mission(); screen_state = 'game'
+                        elif key == 'reset_campaign': reset_campaign()
                         elif key.startswith('difficulty_'): difficulty = key.removeprefix('difficulty_')
             elif not paused:
                 mx, my = event.pos
@@ -459,6 +638,15 @@ while running:
     keys = pygame.key.get_pressed()
     if screen_state == 'game' and not paused:
         game.update(dt, (int(keys[pygame.K_d])-int(keys[pygame.K_a]), int(keys[pygame.K_s])-int(keys[pygame.K_w])), keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT])
+        if game.result and not mission_outcome_processed:
+            mission_outcome_processed = True
+            if game.result == 'Mission complete':
+                previous_sector = campaign['unlocked_sector']
+                campaign = record_completion(campaign)
+                campaign_notice = (f"Sector {campaign['unlocked_sector']} unlocked: the next rescue intensifies."
+                                   if campaign['unlocked_sector'] > previous_sector else 'All campaign sectors are unlocked. Keep improving your rescue record.')
+            else:
+                campaign_notice = f"Sector {game.campaign_level} remains active. Adjust your plan and retry."
         if game.logs[-1] != last_log_message:
             last_log_message = game.logs[-1]
             event_text = game.logs[-1]

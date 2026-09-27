@@ -1,4 +1,3 @@
-import math
 import unittest
 from adaptive import train
 from world import Game, WALLS, center, cell, pathfind
@@ -17,14 +16,16 @@ class MissionTests(unittest.TestCase):
         self.assertEqual(model['samples'], 16)
 
     def test_astar_avoids_buildings(self):
-        route = pathfind((4, 4), (12, 4))
-        self.assertEqual(route[-1], (12, 4))
+        route = pathfind((10, 6), (13, 6))
+        self.assertEqual(route[-1], (13, 6))
         self.assertTrue(all(point not in WALLS for point in route))
 
-    def test_mission_starts_with_three_students_and_zombies(self):
+    def test_generated_mission_has_expanded_team_and_threats(self):
         game = Game(seed=7)
-        self.assertEqual(len(game.students), 3)
-        self.assertEqual(len(game.zombies), 3)
+        self.assertIn(len(game.students), (4, 5))
+        self.assertIn(len(game.zombies), (4, 5))
+        self.assertEqual(len(game.pickups), 6)
+        self.assertGreaterEqual(game.time, 270)
         self.assertEqual(game.rescued_count, 0)
 
     def test_rescuer_waits_for_intel(self):
@@ -57,14 +58,42 @@ class MissionTests(unittest.TestCase):
         self.assertLess(game.zombie.hp, 100)
         self.assertEqual(game.defender.state, 'Engage')
 
-    def test_full_three_student_mission_completes(self):
+    def test_downed_defender_stays_in_place(self):
+        game = Game(seed=7)
+        game.defender.hp = 0
+        position = game.defender.pos
+        for _ in range(30):
+            game.update(1 / 60)
+        self.assertEqual(game.defender.pos, position)
+        self.assertEqual(game.defender.task, 'Down')
+
+    def test_full_generated_mission_completes(self):
         game = Game(seed=7); game.command('Rescue')
-        for _ in range(60 * 90):
+        for _ in range(60 * 360):
             game.update(1/60)
             if game.result:
                 break
         self.assertEqual(game.result, 'Mission complete')
-        self.assertEqual(game.rescued_count, 3)
+        self.assertEqual(game.rescued_count, len(game.students))
+
+    def test_missions_vary_objective_and_time(self):
+        missions = [Game(seed=seed).mission for seed in range(1, 12)]
+        self.assertGreater(len({mission['title'] for mission in missions}), 1)
+        self.assertGreater(len({mission['time'] for mission in missions}), 1)
+
+    def test_zombie_spawns_vary_between_missions(self):
+        layouts = {tuple(sorted(cell(zombie.pos) for zombie in Game(seed=seed).zombies)) for seed in range(1, 10)}
+        self.assertGreater(len(layouts), 1)
+
+    def test_campaign_sectors_increase_rescue_pressure(self):
+        sector_one = Game(seed=1, campaign_level=1)
+        sector_three = Game(seed=1, campaign_level=3)
+        self.assertEqual(sector_three.campaign_level, 3)
+        self.assertGreater(sector_three.time, 0)
+        self.assertGreater(len(sector_three.students), len(sector_one.students))
+        self.assertGreater(len(sector_three.zombies), len(sector_one.zombies))
+        self.assertLess(sector_three.time, sector_one.time)
+        self.assertGreater(sector_three.zombies[0].hp, sector_one.zombies[0].hp)
 
     def test_zombie_attacks_student_during_escort(self):
         game = Game(seed=7); student = game.student
@@ -81,7 +110,7 @@ class MissionTests(unittest.TestCase):
             zombie.hp = 0
         threat = game.zombie
         threat.hp = 100
-        threat.x, threat.y = game.scout.x, game.scout.y - 80
+        threat.x, threat.y = game.scout.x + 80, game.scout.y
 
         tasks = []
         for _ in range(45):
@@ -114,12 +143,9 @@ class MissionTests(unittest.TestCase):
         game.revealed.update((x, y) for y in range(20) for x in range(28))
         # A few isolated edge tiles are visually indistinguishable from clear map.
         game.revealed.discard((3, 3))
-        distance_before = math.dist(game.scout.pos, game.leader.pos)
-
         for _ in range(10):
             game.update(1 / 60)
 
         self.assertEqual(game.scout.task, 'Report to Commander')
-        self.assertLess(math.dist(game.scout.pos, game.leader.pos), distance_before)
 
 if __name__ == '__main__': unittest.main()

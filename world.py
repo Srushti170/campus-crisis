@@ -7,14 +7,17 @@ import random
 from pathlib import Path
 
 TILE=32; COLS,ROWS=28,20
-BUILDINGS=[(5,3,6,5,'LIBRARY'),(16,3,7,5,'SCIENCE'),(6,12,6,5,'LECTURE HALL'),(18,12,6,5,'CAFETERIA')]
+BUILDINGS=[(1,1,8,4,'ADMIN BLOCK'),(14,1,7,4,'LIBRARY'),(1,7,9,4,'SCIENCE LAB'),(16,7,6,4,'LECTURE HALL'),(1,13,9,4,'HOSTEL'),(12,13,8,4,'CAFETERIA'),(21,13,6,5,'SPORTS COURT')]
 WALLS={(x,y) for bx,by,w,h,_ in BUILDINGS for x in range(bx,bx+w) for y in range(by,by+h)}
-SAFE=(1,15,4,4)
+SAFE=(3,17,5,3)
 # Logical campus landmarks. They anchor resource placement and appear on the map.
-LANDMARKS=[('CLINIC',(2,12,3,2),'medkit'),('SECURITY',(25,3,3,3),'ammo'),('GENERATOR',(13,17,3,2),'fuel'),('PARKING',(25,12,3,5),'parking')]
+LANDMARKS=[('CLINIC',(10,12,2,2),'medkit'),('SECURITY',(25,5,2,3),'ammo'),('GENERATOR',(10,17,2,2),'fuel'),('PARKING',(22,1,5,4),'parking')]
 def center(c): return ((c[0]+.5)*TILE,(c[1]+.5)*TILE)
 def cell(p): return (int(p[0]//TILE),int(p[1]//TILE))
-def walkable(p): return 0<=p[0]<COLS and 0<=p[1]<ROWS and p not in WALLS
+def walkable(p):
+    """Outdoor campus routes; the fenced map edge and buildings are inaccessible."""
+    x, y = p
+    return 1 <= x < COLS-1 and 1 <= y < ROWS-1 and p not in WALLS
 def pathfind(start,goal):
     if not walkable(start) or not walkable(goal): return []
     frontier=[(0,start)]; cost={start:0}; came={}
@@ -39,36 +42,61 @@ class Actor:
     def alive(self): return self.hp>0
 @dataclass
 class Pickup:
-    x:float; y:float; kind:str; name:str; discovered:bool=False; collected:bool=False
+    x:float; y:float; kind:str; name:str; discovered:bool=False; collected:bool=False; pulse:float=0
     @property
     def pos(self): return (self.x,self.y)
 class Game:
-    def __init__(self, seed=None):
+    def __init__(self, seed=None, campaign_level=1):
         self.seed = seed if seed is not None else random.randrange(1, 2**31)
         self.random = random.Random(self.seed)
-        self.leader=Actor(*center((3,16)),'Leader','Leader'); self.rescuer=Actor(*center((4,14)),'Rescuer','Rescuer'); self.medic=Actor(*center((2,14)),'Medic','Medic'); self.defender=Actor(*center((5,16)),'Defender','Defender'); self.scout=Actor(*center((3,12)),'Scout','Scout')
-        zombie_spawns=((25,10),(10,18),(14,2))
-        rescue_points=((24,4),(14,10),(26,16),(4,8),(4,17),(24,14),(15,18),(25,7))
+        self.campaign_level = min(3, max(1, campaign_level))
+        self.leader=Actor(*center((4,18)),'Leader','Leader'); self.rescuer=Actor(*center((5,18)),'Rescuer','Rescuer'); self.medic=Actor(*center((3,18)),'Medic','Medic'); self.defender=Actor(*center((6,18)),'Defender','Defender'); self.scout=Actor(*center((5,17)),'Scout','Scout')
+        missions=(
+            {'title':'Campus Evacuation','students':4,'zombies':4,'time':300,'fuel':1,'objective':'Locate and evacuate every stranded student.'},
+            {'title':'Emergency Power','students':4,'zombies':4,'time':270,'fuel':2,'objective':'Restore generator fuel, then evacuate every student.'},
+            {'title':'Mass Rescue','students':5,'zombies':5,'time':330,'fuel':1,'objective':'Evacuate all students before the outbreak spreads.'},
+        )
+        base_mission=self.random.choice(missions)
+        sector_pressure=self.campaign_level-1
+        self.mission={**base_mission,
+                      'students':base_mission['students'] + (1 if self.campaign_level == 3 else 0),
+                      'zombies':base_mission['zombies'] + sector_pressure,
+                      'time':max(180, base_mission['time'] - sector_pressure*30),
+                      'sector':self.campaign_level}
+        zombie_spawn_pool=((11,3),(13,6),(22,6),(24,10),(11,11),(14,12),(22,11),(10,17),(20,18),(25,9),(10,6),(23,18),(12,1))
+        team_start=((4,18),(5,18),(3,18),(6,18),(5,17))
+        zombie_spawn_pool=tuple(point for point in zombie_spawn_pool if all(math.dist(point, member) >= 5 for member in team_start))
+        zombie_spawns=self.random.sample(zombie_spawn_pool, self.mission['zombies'])
+        rescue_points=((10,3),(13,4),(21,4),(10,8),(15,8),(22,8),(10,10),(15,10),(22,10),(10,15),(11,16),(20,15),(20,17),(25,11))
         safe_points=[point for point in rescue_points if all(math.dist(point, zombie) >= 3 for zombie in zombie_spawns)]
-        selected_points=self.random.sample(safe_points, 3)
+        selected_points=self.random.sample(safe_points, self.mission['students'])
         self.students=[Actor(*center(c),'Student',f'Student-{i+1}',state='Waiting') for i,c in enumerate(selected_points)]
         self.zombies=[Actor(*center(c),'Zombie',f'Zombie-{i+1}',state='Patrol') for i,c in enumerate(zombie_spawns)]
-        self.pickups=[Pickup(*center(c),kind,name) for kind,c,name in (('medkit',(3,13),'Clinic Medkit'),('ammo',(26,4),'Security Ammo'),('fuel',(14,18),'Generator Fuel'),('fuel',(26,14),'Parking Fuel'),('medkit',(20,10),'Cafeteria Medkit'))]
+        resource_sites={
+            'medkit':(('Clinic Medkit',(10,12)),('Hostel First-Aid Kit',(10,16)),('Cafeteria Medkit',(20,12))),
+            'ammo':(('Security Ammo',(25,6)),('Admin Security Locker',(10,4)),('Sports Equipment Locker',(20,17))),
+            'fuel':(('Generator Fuel',(10,18)),('Parking Fuel Can',(22,5)),('Science Lab Fuel',(10,11))),
+        }
+        selected_resources=[]
+        for kind, sites in resource_sites.items():
+            selected_resources.extend((kind,point,name) for name,point in self.random.sample(sites, 2))
+        self.pickups=[Pickup(*center(point),kind,name) for kind,point,name in selected_resources]
         self.student,self.zombie=self.students[0],self.zombies[0]; self.actors=[self.leader,self.rescuer,self.medic,self.defender,self.scout,*self.students,*self.zombies]
-        self.time=240.; self.elapsed=0.; self.result=None; self.order='Follow'; self.escort_student=None; self.defender_target=None; self.medkits=3; self.ammo=20; self.fuel=0; self.fuel_required=1; self.shove_cooldown=0; self.routes={}; self.scout_points=[(3,3),(10,2),(14,8),(25,4),(26,14),(16,18),(7,18)]; self.scout_point=0; self.revealed=set()
-        self.discovered={'Student':False,'Zombie':False,**{a.name:False for a in (*self.students,*self.zombies)}}; self.reveal(self.leader.pos,2.5); self.reveal(self.scout.pos,3); self.logs=['Three students require extraction.','Scout: searching unexplored campus sectors.','Queue the rescue order with E.']
+        self.time=float(self.mission['time']); self.elapsed=0.; self.result=None; self.order='Follow'; self.escort_student=None; self.defender_target=None; self.medkits=max(1,3-sector_pressure); self.ammo=20; self.fuel=0; self.fuel_required=self.mission['fuel']; self.shove_cooldown=0; self.routes={}; self.scout_points=[(11,2),(22,3),(11,8),(23,8),(11,15),(20,15),(25,11)]; self.scout_point=0; self.revealed=set()
+        for zombie in self.zombies: zombie.hp += sector_pressure*12
+        self.discovered={'Student':False,'Zombie':False,**{a.name:False for a in (*self.students,*self.zombies)}}; self.reveal(self.leader.pos,2.5); self.reveal(self.scout.pos,3); self.logs=[self.mission['title']+': '+self.mission['objective'],'Scout: searching unexplored campus sectors.','Queue the rescue order with E.']
         self.stats={'students_rescued':0,'zombies_neutralized':0,'medkits_used':0,'damage_taken':0,'task_changes':0}
     @property
     def rescued_count(self): return sum(s.state=='Rescued' for s in self.students)
     def log(self,msg): self.logs=(self.logs+[msg])[-6:]
     def collect(self,pickup,collector):
-        pickup.collected=True
+        pickup.collected=True; pickup.pulse=.45
         if pickup.kind=='medkit': self.medkits+=1
         elif pickup.kind=='ammo': self.ammo+=6
         else: self.fuel+=1
         self.log(f'{collector.role}: collected {pickup.kind}.')
     def save_stats(self):
-        record={**self.stats,'outcome':self.result,'time_remaining':round(self.time,1),'fuel':self.fuel,'ammo':self.ammo}
+        record={**self.stats,'outcome':self.result,'time_remaining':round(self.time,1),'fuel':self.fuel,'ammo':self.ammo,'mission':self.mission['title'],'sector':self.campaign_level,'students_required':len(self.students),'zombies_deployed':len(self.zombies),'fuel_required':self.fuel_required}
         path=Path(__file__).parent/'logs'/'mission_history.json'; path.parent.mkdir(exist_ok=True)
         history=json.loads(path.read_text()) if path.exists() else []; history.append(record); path.write_text(json.dumps(history,indent=2))
     def task_score(self,p,s,d,r=0): return round(p+s-d/24-r)
@@ -122,7 +150,10 @@ class Game:
         candidates=[i for i in range(len(self.scout_points)) if i != exclude] or list(range(len(self.scout_points)))
         return max(candidates, key=lambda i: (self.scout_unseen_coverage(self.scout_points[i]), -math.dist(pos,center(self.scout_points[i]))))
     def scout_ai(self,dt):
-        a=self.scout; danger=self.nearest(a.pos)
+        a=self.scout
+        if not a.alive:
+            a.state='Down'; a.task='Down'; return
+        danger=self.nearest(a.pos)
         remaining_fog=max(self.scout_unseen_coverage(point) for point in self.scout_points)
         # Use hysteresis: a Scout that spots danger commits to its retreat instead
         # of flipping between Explore and Avoid at the exact vision boundary.
@@ -154,9 +185,11 @@ class Game:
                 pickup.discovered=True; self.log(f'Scout: {pickup.kind} located at {pickup.name}.')
     def rescuer_ai(self,dt):
         r=self.rescuer
+        if not r.alive:
+            r.state='Down'; r.task='Down'; return
         if self.order=='Rescue':
             if self.escort_student:
-                s=self.escort_student; self.assign(r,f'Escort {s.name}',95,f'escorting {s.name} to safety'); self.navigate(r,center((3,17)),88,dt,8); self.navigate(s,r.pos,94,dt,27)
+                s=self.escort_student; safe_center=center((SAFE[0]+SAFE[2]//2, SAFE[1]+SAFE[3]//2)); self.assign(r,f'Escort {s.name}',95,f'escorting {s.name} to safety'); self.navigate(r,safe_center,88,dt,8); self.navigate(s,r.pos,94,dt,27)
                 x,y=cell(s.pos)
                 if SAFE[0]<=x<SAFE[0]+SAFE[2] and SAFE[1]<=y<SAFE[1]+SAFE[3] and (self.rescued_count < len(self.students)-1 or self.fuel >= self.fuel_required):s.state='Rescued';self.escort_student=None;self.stats['students_rescued']+=1;self.log(f'{s.name} evacuated. {self.rescued_count}/{len(self.students)} students safe.')
             else:
@@ -173,7 +206,10 @@ class Game:
         elif self.order=='Follow':self.assign(r,'Follow Commander',30,'following Commander');self.navigate(r,self.leader.pos,104,dt,45)
         else:self.assign(r,'Hold Position',20,'holding position')
     def medic_ai(self,dt):
-        m=self.medic; patients=[a for a in (self.leader,self.rescuer,self.defender,self.scout,*self.students) if a.alive and a.state!='Rescued' and a.hp<82]
+        m=self.medic
+        if not m.alive:
+            m.state='Down'; m.task='Down'; return
+        patients=[a for a in (self.leader,self.rescuer,self.defender,self.scout,*self.students) if a.alive and a.state!='Rescued' and a.hp<82]
         kits=[p for p in self.pickups if p.kind=='medkit' and p.discovered and not p.collected]
         if self.medkits==0 and kits:
             pickup=min(kits,key=lambda p:math.dist(m.pos,p.pos));self.assign(m,f'Collect {pickup.name}',65,'restocking medical supplies');self.navigate(m,pickup.pos,100,dt,18)
@@ -184,7 +220,10 @@ class Game:
             if math.dist(m.pos,p.pos)<32 and not m.cooldown:p.hp=min(100,p.hp+38);p.flash=.35;self.medkits-=1;self.stats['medkits_used']+=1;m.cooldown=3;self.log(f'Medic: {p.name} stabilized. {self.medkits} medkit(s) remain.')
         else:self.assign(m,'Support Escort',self.task_score(10,30,math.dist(m.pos,self.rescuer.pos)),'supporting the escort');self.navigate(m,self.rescuer.pos,92,dt,55)
     def defender_ai(self,dt):
-        d=self.defender; ammo_pickups=[p for p in self.pickups if p.kind=='ammo' and p.discovered and not p.collected]
+        d=self.defender
+        if not d.alive:
+            d.state='Down'; d.task='Down'; return
+        ammo_pickups=[p for p in self.pickups if p.kind=='ammo' and p.discovered and not p.collected]
         if self.ammo<=2 and ammo_pickups:
             p=min(ammo_pickups,key=lambda p:math.dist(d.pos,p.pos));self.assign(d,f'Collect {p.name}',70,'restocking ammunition');self.navigate(d,p.pos,112,dt,16)
             if math.dist(d.pos,p.pos)<20:self.collect(p,d)
@@ -214,7 +253,10 @@ class Game:
             t=min(escorted,key=lambda a:math.dist(z.pos,a.pos)) if escorted else (self.defender if self.defender in targets else min(targets,key=lambda a:math.dist(z.pos,a.pos)));z.target_name=t.name;z.last_seen=t.pos;z.search_time=3
             if math.dist(z.pos,t.pos)<27:
                 z.state='Attack'
-                if not z.cooldown:t.hp=max(0,t.hp-6);t.flash=.3;z.cooldown=.75
+                if not z.cooldown:
+                    t.hp=max(0,t.hp-6);t.flash=.3;z.cooldown=.75
+                    if not t.alive:
+                        z.target_name=''; z.last_seen=None; z.search_time=0; z.state='Patrol'
             else:z.state='Chase';self.navigate(z,t.pos,76,dt,20)
         elif z.last_seen:
             z.target_name=''
@@ -228,6 +270,7 @@ class Game:
         if self.result:return
         dt=min(dt,.05);self.elapsed+=dt;self.time=max(0,self.time-dt);self.shove_cooldown=max(0,self.shove_cooldown-dt)
         for a in self.actors:a.moving=False;a.flash=max(0,a.flash-dt);a.cooldown=max(0,a.cooldown-dt);a.stun=max(0,a.stun-dt)
+        for pickup in self.pickups: pickup.pulse=max(0,pickup.pulse-dt)
         dx,dy=movement;n=math.hypot(dx,dy)
         if n and self.leader.alive:self.move(self.leader,dx/n*(158 if sprint else 112)*dt,dy/n*(158 if sprint else 112)*dt)
         self.scout_ai(dt);self.rescuer_ai(dt);self.medic_ai(dt);self.defender_ai(dt)
