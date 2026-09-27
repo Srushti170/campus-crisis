@@ -3,12 +3,15 @@ from dataclasses import dataclass
 import heapq
 import math
 import json
+import random
 from pathlib import Path
 
 TILE=32; COLS,ROWS=28,20
 BUILDINGS=[(5,3,6,5,'LIBRARY'),(16,3,7,5,'SCIENCE'),(6,12,6,5,'LECTURE HALL'),(18,12,6,5,'CAFETERIA')]
 WALLS={(x,y) for bx,by,w,h,_ in BUILDINGS for x in range(bx,bx+w) for y in range(by,by+h)}
 SAFE=(1,15,4,4)
+# Logical campus landmarks. They anchor resource placement and appear on the map.
+LANDMARKS=[('CLINIC',(2,12,3,2),'medkit'),('SECURITY',(25,3,3,3),'ammo'),('GENERATOR',(13,17,3,2),'fuel'),('PARKING',(25,12,3,5),'parking')]
 def center(c): return ((c[0]+.5)*TILE,(c[1]+.5)*TILE)
 def cell(p): return (int(p[0]//TILE),int(p[1]//TILE))
 def walkable(p): return 0<=p[0]<COLS and 0<=p[1]<ROWS and p not in WALLS
@@ -29,7 +32,7 @@ def pathfind(start,goal):
     return []
 @dataclass
 class Actor:
-    x:float; y:float; role:str; name:str=''; hp:float=100; state:str='Idle'; facing:tuple=(0,1); moving:bool=False; flash:float=0; task:str='Idle'; task_score:int=0; last_seen:tuple|None=None; search_time:float=0; cooldown:float=0; stun:float=0; patrol:int=0
+    x:float; y:float; role:str; name:str=''; hp:float=100; state:str='Idle'; facing:tuple=(0,1); moving:bool=False; flash:float=0; task:str='Idle'; task_score:int=0; last_seen:tuple|None=None; search_time:float=0; cooldown:float=0; stun:float=0; patrol:int=0; target_name:str=''
     @property
     def pos(self): return (self.x,self.y)
     @property
@@ -40,11 +43,17 @@ class Pickup:
     @property
     def pos(self): return (self.x,self.y)
 class Game:
-    def __init__(self):
+    def __init__(self, seed=None):
+        self.seed = seed if seed is not None else random.randrange(1, 2**31)
+        self.random = random.Random(self.seed)
         self.leader=Actor(*center((3,16)),'Leader','Leader'); self.rescuer=Actor(*center((4,14)),'Rescuer','Rescuer'); self.medic=Actor(*center((2,14)),'Medic','Medic'); self.defender=Actor(*center((5,16)),'Defender','Defender'); self.scout=Actor(*center((3,12)),'Scout','Scout')
-        self.students=[Actor(*center(c),'Student',f'Student-{i+1}',state='Waiting') for i,c in enumerate(((24,4),(14,10),(26,16)))]
-        self.zombies=[Actor(*center(c),'Zombie',f'Zombie-{i+1}',state='Patrol') for i,c in enumerate(((25,10),(10,18),(14,2)))]
-        self.pickups=[Pickup(*center(c),kind,f'{kind.title()}-{i+1}') for i,(kind,c) in enumerate((('medkit',(8,10)),('ammo',(23,16)),('fuel',(15,18)),('fuel',(13,2)),('medkit',(26,8))))]
+        zombie_spawns=((25,10),(10,18),(14,2))
+        rescue_points=((24,4),(14,10),(26,16),(4,8),(4,17),(24,14),(15,18),(25,7))
+        safe_points=[point for point in rescue_points if all(math.dist(point, zombie) >= 3 for zombie in zombie_spawns)]
+        selected_points=self.random.sample(safe_points, 3)
+        self.students=[Actor(*center(c),'Student',f'Student-{i+1}',state='Waiting') for i,c in enumerate(selected_points)]
+        self.zombies=[Actor(*center(c),'Zombie',f'Zombie-{i+1}',state='Patrol') for i,c in enumerate(zombie_spawns)]
+        self.pickups=[Pickup(*center(c),kind,name) for kind,c,name in (('medkit',(3,13),'Clinic Medkit'),('ammo',(26,4),'Security Ammo'),('fuel',(14,18),'Generator Fuel'),('fuel',(26,14),'Parking Fuel'),('medkit',(20,10),'Cafeteria Medkit'))]
         self.student,self.zombie=self.students[0],self.zombies[0]; self.actors=[self.leader,self.rescuer,self.medic,self.defender,self.scout,*self.students,*self.zombies]
         self.time=240.; self.elapsed=0.; self.result=None; self.order='Follow'; self.escort_student=None; self.defender_target=None; self.medkits=3; self.ammo=20; self.fuel=0; self.fuel_required=1; self.shove_cooldown=0; self.routes={}; self.scout_points=[(3,3),(10,2),(14,8),(25,4),(26,14),(16,18),(7,18)]; self.scout_point=0; self.revealed=set()
         self.discovered={'Student':False,'Zombie':False,**{a.name:False for a in (*self.students,*self.zombies)}}; self.reveal(self.leader.pos,2.5); self.reveal(self.scout.pos,3); self.logs=['Three students require extraction.','Scout: searching unexplored campus sectors.','Queue the rescue order with E.']
@@ -101,15 +110,40 @@ class Game:
         if self.result or self.shove_cooldown:return
         self.shove_cooldown=.65; z=min((z for z in self.zombies if z.alive and math.dist(z.pos,self.leader.pos)<64 and self.visible(z.pos,self.leader.pos)),key=lambda z:math.dist(z.pos,self.leader.pos),default=None)
         if z:z.hp=max(0,z.hp-34); z.flash=.25; z.stun=.5; z.state='Stunned' if z.alive else 'Dead'; self.log('Commander: zombie neutralized.' if not z.alive else 'Commander: zombie stunned!')
+    def scout_unseen_coverage(self, point):
+        """Return how many walkable fog tiles a Scout can reveal from a sector."""
+        return sum(
+            walkable((x,y)) and (x,y) not in self.revealed and math.dist((x,y),point)<=3.6
+            for y in range(max(0,point[1]-4),min(ROWS,point[1]+5))
+            for x in range(max(0,point[0]-4),min(COLS,point[0]+5))
+        )
+    def choose_scout_sector(self, pos, exclude=None):
+        """Prefer unexplored fog, then prefer the closest route to it."""
+        candidates=[i for i in range(len(self.scout_points)) if i != exclude] or list(range(len(self.scout_points)))
+        return max(candidates, key=lambda i: (self.scout_unseen_coverage(self.scout_points[i]), -math.dist(pos,center(self.scout_points[i]))))
     def scout_ai(self,dt):
         a=self.scout; danger=self.nearest(a.pos)
+        remaining_fog=max(self.scout_unseen_coverage(point) for point in self.scout_points)
         # Use hysteresis: a Scout that spots danger commits to its retreat instead
         # of flipping between Explore and Avoid at the exact vision boundary.
-        if danger and math.dist(a.pos,danger.pos)<110 and self.visible(a.pos,danger.pos): a.cooldown=1.5
+        if danger and math.dist(a.pos,danger.pos)<96 and self.visible(a.pos,danger.pos):
+            if a.task != 'Avoid Zombie':
+                # Do not repeatedly re-enter the same dangerous sector.
+                self.scout_point=self.choose_scout_sector(a.pos,exclude=self.scout_point)
+            a.cooldown=2.0
         if a.cooldown>0: self.assign(a,'Avoid Zombie',self.task_score(80,50,math.dist(a.pos,self.leader.pos)),'danger detected; returning to Commander'); self.navigate(a,self.leader.pos,124,dt,52)
+        elif remaining_fog <= 6:
+            # All planned sectors are clear. A fixed patrol target would now be
+            # arbitrary and causes route switching, so the Scout rejoins the team.
+            self.assign(a,'Report to Commander',48,'campus search complete; reporting to Commander')
+            self.navigate(a,self.leader.pos,104,dt,52)
         else:
+            current=self.scout_points[self.scout_point]
+            # Once a sector is clear, choose the remaining fog with the largest
+            # reveal value. This stops the Scout patrolling already-known ground.
+            if self.scout_unseen_coverage(current)<=6 or math.dist(a.pos,center(current))<9:
+                self.scout_point=self.choose_scout_sector(a.pos,exclude=self.scout_point)
             dest=center(self.scout_points[self.scout_point]); self.assign(a,f'Explore Sector {self.scout_point+1}',self.task_score(55,55,math.dist(a.pos,dest)),f'exploring sector {self.scout_point+1}'); self.navigate(a,dest,108,dt,7)
-            if math.dist(a.pos,dest)<9:self.scout_point=(self.scout_point+1)%len(self.scout_points)
         self.reveal(a.pos,3.6); self.reveal(self.leader.pos,2.2)
         for s in self.students:
             if s.state=='Waiting' and math.dist(a.pos,s.pos)<150 and self.visible(a.pos,s.pos):self.discover(s,f'survivor found: {s.name}; transmitting rescue location.')
@@ -164,7 +198,9 @@ class Game:
                 if not d.cooldown and self.ammo:z.hp=max(0,z.hp-14);self.ammo-=1;z.flash=.25;d.cooldown=.58;self.stats['zombies_neutralized']+=int(not z.alive);self.log(f'Defender: {z.name} neutralized.' if not z.alive else f'Defender: engaging {z.name}.')
         else:self.assign(d,'Guard Escort',self.task_score(12,45,math.dist(d.pos,self.rescuer.pos)),'guarding the rescue team');self.navigate(d,self.rescuer.pos,96,dt,62)
     def zombie_ai(self,z,dt,sprint):
-        if not z.alive or z.stun:return
+        if not z.alive or z.stun:
+            z.target_name=''
+            return
         # Waiting students are concealed in their classrooms. Once a Rescuer makes
         # contact they become an exposed escort target, creating rescue risk
         # without allowing an unseen patrol to end the mission immediately.
@@ -175,15 +211,17 @@ class Game:
             # the rescue threat visible instead of silently redirecting attacks
             # to a nearby Rescuer or Defender.
             escorted=[a for a in targets if a.role=='Student' and a.state=='Following']
-            t=min(escorted,key=lambda a:math.dist(z.pos,a.pos)) if escorted else (self.defender if self.defender in targets else min(targets,key=lambda a:math.dist(z.pos,a.pos)));z.last_seen=t.pos;z.search_time=3
+            t=min(escorted,key=lambda a:math.dist(z.pos,a.pos)) if escorted else (self.defender if self.defender in targets else min(targets,key=lambda a:math.dist(z.pos,a.pos)));z.target_name=t.name;z.last_seen=t.pos;z.search_time=3
             if math.dist(z.pos,t.pos)<27:
                 z.state='Attack'
                 if not z.cooldown:t.hp=max(0,t.hp-6);t.flash=.3;z.cooldown=.75
             else:z.state='Chase';self.navigate(z,t.pos,76,dt,20)
         elif z.last_seen:
+            z.target_name=''
             z.state='Search';self.navigate(z,z.last_seen,66,dt);z.search_time-=dt
             if z.search_time<=0:z.last_seen=None
         else:
+            z.target_name=''
             z.state='Patrol';pts=[(25,10),(25,2),(14,2),(14,10)];dest=center(pts[(z.patrol+self.zombies.index(z))%4]);self.navigate(z,dest,48,dt)
             if math.dist(z.pos,dest)<6:z.patrol=(z.patrol+1)%4
     def update(self,dt,movement=(0,0),sprint=False):

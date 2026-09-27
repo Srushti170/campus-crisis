@@ -8,12 +8,14 @@ from pathlib import Path
 parser = argparse.ArgumentParser()
 parser.add_argument('--smoke-test', action='store_true', help='Render 120 frames without a window')
 parser.add_argument('--screenshot', type=str, help='Save a frame and exit')
+parser.add_argument('--preview-game', action='store_true', help='Open directly into a mission for visual review')
 args = parser.parse_args()
 if args.smoke_test or args.screenshot:
     os.environ['SDL_VIDEODRIVER'] = 'dummy'
     os.environ['SDL_AUDIODRIVER'] = 'dummy'
 import pygame
-from world import Game, TILE, COLS, ROWS, BUILDINGS, SAFE, center
+from world import Game, TILE, COLS, ROWS, BUILDINGS, SAFE, LANDMARKS, center
+from adaptive import recommend, report
 
 pygame.mixer.pre_init(44100, -16, 1, 512)
 pygame.init()
@@ -21,16 +23,20 @@ WIDTH, HEIGHT = 1200, 760
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption('Campus Crisis | First Response')
 clock = pygame.time.Clock()
-fonts = {size: pygame.font.SysFont('segoeui', size, bold=size >= 24) for size in (12, 14, 16, 18, 24, 32, 48)}
+fonts = {size: pygame.font.SysFont('segoeui', size, bold=size >= 24) for size in (12, 13, 14, 16, 18, 24, 32, 48)}
 INK, MUTED, GREEN = (224, 235, 233), (143, 164, 166), (100, 231, 174)
 OX, OY = 20, 94
 game = Game()
 selected, paused, debug = True, False, False
 screen_state, difficulty = 'menu', 'Normal'
+adaptive_plan = recommend()
+adaptive_data = report()
 menu_buttons = {}
 last_log_message = ''
 audio_muted = False
 mute_button = pygame.Rect(1052, 45, 130, 32)
+if args.preview_game:
+    screen_state = 'game'
 ASSET_ROOT = Path(__file__).parent / 'assets' / 'kenney-top-down-shooter'
 
 
@@ -113,6 +119,13 @@ def draw_map():
     rect((36, 53, 58), (safe.x+13, safe.bottom-37, 39, 22), 3)
     rect(generator_color, (safe.x+18, safe.bottom-32, 29, 12), 2)
     text('GEN ON' if game.fuel >= game.fuel_required else 'NEEDS FUEL', safe.x+6, safe.bottom-14, 12, generator_color)
+    # Evacuation tent and school bus make the Safe Zone immediately readable.
+    rect((232, 184, 66), (safe.x+58, safe.y+42, 55, 27), 5)
+    rect((66, 109, 135), (safe.x+65, safe.y+47, 31, 11), 2)
+    pygame.draw.circle(screen, (35, 43, 45), (safe.x+69, safe.y+70), 5)
+    pygame.draw.circle(screen, (35, 43, 45), (safe.x+102, safe.y+70), 5)
+    pygame.draw.polygon(screen, (226, 235, 221), [(safe.x+7, safe.y+92), (safe.x+27, safe.y+72), (safe.x+47, safe.y+92)])
+    text('EVAC', safe.x+12, safe.y+93, 12, GREEN)
     for i, (x, y, w, h, label) in enumerate(BUILDINGS):
         box = pygame.Rect(OX+x*TILE, OY+y*TILE, w*TILE, h*TILE)
         rect((23, 39, 36), box.move(7, 9), 5)
@@ -123,12 +136,60 @@ def draw_map():
             rect((114, 180, 183), (wx, box.bottom-29, 21, 13), 2)
         rect((46, 60, 64), (box.x+18, box.y+50, w*TILE-36, 44), 3)
         text(label, box.x+27, box.y+61, 14)
+        interior = pygame.Rect(box.x+22, box.y+102, box.width-44, box.height-126)
+        if label == 'LIBRARY':
+            for shelf_x in range(interior.x, interior.right, 32):
+                rect((113, 73, 43), (shelf_x, interior.y, 20, interior.height), 2)
+                for book_y in range(interior.y+4, interior.bottom, 10):
+                    rect((205, 151, 68), (shelf_x+3, book_y, 14, 4), 1)
+        elif label == 'SCIENCE':
+            for bench_x in range(interior.x, interior.right, 46):
+                rect((180, 191, 187), (bench_x, interior.y+4, 35, 13), 2)
+                pygame.draw.circle(screen, (106, 207, 210), (bench_x+10, interior.y+10), 4)
+                pygame.draw.circle(screen, (209, 135, 176), (bench_x+24, interior.y+10), 4)
+        elif label == 'LECTURE HALL':
+            for row in range(2):
+                for desk_x in range(interior.x, interior.right, 30):
+                    rect((170, 123, 70), (desk_x, interior.y+row*19, 21, 11), 2)
+        else:
+            for table_x in range(interior.x+8, interior.right, 50):
+                pygame.draw.circle(screen, (211, 188, 143), (table_x, interior.y+14), 12)
+                pygame.draw.circle(screen, (73, 88, 87), (table_x-16, interior.y+14), 5)
+                pygame.draw.circle(screen, (73, 88, 87), (table_x+16, interior.y+14), 5)
         rect((129, 145, 139), (box.centerx-18, box.bottom-6, 36, 6))
+        rect((230, 185, 80), (box.centerx-13, box.bottom-9, 26, 5), 2)
+    for label, (x, y, w, h), kind in LANDMARKS:
+        box = pygame.Rect(OX+x*TILE, OY+y*TILE, w*TILE, h*TILE)
+        if kind == 'parking':
+            rect((57, 67, 70), box, 4)
+            for lane in range(box.x+12, box.right-8, 24):
+                pygame.draw.line(screen, (155, 163, 151), (lane, box.y+7), (lane, box.bottom-7), 2)
+            text('P', box.centerx-5, box.centery-12, 24, (222, 228, 210))
+        else:
+            roof = {'medkit': (192, 76, 74), 'ammo': (194, 143, 55), 'fuel': (57, 129, 177)}[kind]
+            rect((26, 42, 43), box.move(4, 6), 4)
+            rect(roof, box, 4)
+            rect((222, 232, 221), box.inflate(-12, -12), 3)
+            if kind == 'medkit':
+                rect((207, 77, 79), (box.centerx-4, box.centery-12, 8, 24))
+                rect((207, 77, 79), (box.centerx-12, box.centery-4, 24, 8))
+            elif kind == 'ammo':
+                for offset in (-8, 0, 8):
+                    pygame.draw.rect(screen, (64, 49, 37), (box.centerx+offset-2, box.centery-10, 4, 20), border_radius=2)
+            else:
+                rect((47, 92, 120), (box.centerx-12, box.centery-11, 24, 22), 3)
+                text('⚡', box.centerx-7, box.centery-9, 14, (239, 226, 135))
+        text(label, box.x, box.bottom+3, 12, roof if kind != 'parking' else (205, 216, 206))
     for x, y in [(1, 2), (1, 6), (8, 1), (20, 1), (16, 15), (16, 18), (27, 15), (9, 18)]:
         px, py = OX+x*TILE+16, OY+y*TILE+16
         pygame.draw.circle(screen, (26, 45, 38), (px+4, py+6), 18)
         pygame.draw.circle(screen, (54, 97, 67), (px, py), 17)
         pygame.draw.circle(screen, (72, 115, 76), (px-5, py-5), 10)
+    # Lockers and evacuation arrows give the roads the feel of school hallways.
+    for x, y in [(4, 9), (8, 9), (16, 9), (20, 9), (24, 9)]:
+        rect((80, 121, 137), (OX+x*TILE, OY+y*TILE+4, 23, 24), 2)
+        pygame.draw.line(screen, (161, 206, 216), (OX+x*TILE+5, OY+y*TILE+7), (OX+x*TILE+5, OY+y*TILE+25), 1)
+    text('← SAFE EXIT', OX+4*TILE, OY+10*TILE+6, 12, (221, 232, 207))
     text('EAST CAMPUS', OX+750, OY+18, 12, (180, 192, 173))
 
 
@@ -164,6 +225,10 @@ def draw_actor(a):
     rect((22, 32, 34), (x-17, y-28, 34, 4), 2)
     rect((224, 104, 100) if a.hp < 40 else GREEN, (x-17, y-28, int(34*a.hp/100), 4), 2)
     text(a.role, x-23, y+21, 12, color)
+    if a.role == 'Student' and a.state == 'Waiting':
+        radius = 9 + int((math.sin(game.elapsed * 5) + 1) * 2)
+        pygame.draw.circle(screen, (241, 99, 95), (x, y-42), radius, 2)
+        text('HELP', x-17, y-49, 12, (255, 211, 154))
     if debug:
         text(a.state, x-23, y+36, 12)
 
@@ -206,6 +271,21 @@ def draw_pickup(pickup):
     text(label, x-24, y+14, 12, colors[pickup.kind])
 
 
+def draw_threat_markers():
+    """Show the exact person an active zombie is hunting."""
+    actors_by_name = {actor.name: actor for actor in game.actors}
+    pulse = 23 + int((math.sin(game.elapsed * 7) + 1) * 3)
+    for zombie in game.zombies:
+        target = actors_by_name.get(zombie.target_name)
+        if not zombie.alive or not target or not target.alive or target.state == 'Rescued':
+            continue
+        x, y = int(OX + target.x), int(OY + target.y)
+        # A compact warning reticle reads as a combat cue without hiding the sprite.
+        pygame.draw.circle(screen, (238, 93, 88), (x, y), pulse, 2)
+        pygame.draw.line(screen, (238, 93, 88), (x-11, y-30), (x+11, y-30), 2)
+        text('ZOMBIE TARGET', x-38, y-47, 12, (250, 148, 136))
+
+
 def draw():
     if screen_state != 'game':
         draw_menu()
@@ -227,6 +307,7 @@ def draw():
     for pickup in game.pickups:
         draw_pickup(pickup)
     visible_actors = [a for a in game.actors if a.role not in ('Student', 'Zombie') or game.discovered[a.name]]
+    draw_threat_markers()
     for a in sorted(visible_actors, key=lambda a: a.y):
         draw_actor(a)
     rect((24, 38, 45), (932, 94, 256, 640), 8)
@@ -250,8 +331,10 @@ def draw():
     text(f'Defender: {game.defender.task}  [{game.defender.task_score}]', 946, 571, 12, MUTED)
     text(f'Medkits: {game.medkits}  |  Ammo: {game.ammo}', 946, 589, 12, (126, 224, 195))
     text(f'Fuel: {game.fuel}/{game.fuel_required} for final evacuation', 946, 604, 12, (70, 160, 215))
-    text('FIELD COMMS', 946, 610, 14, GREEN)
-    y = 633
+    active_targets = [f'{z.name} -> {z.target_name}' for z in game.zombies if z.target_name]
+    text('THREAT: '+(', '.join(active_targets) if active_targets else 'No active pursuit'), 946, 619, 12, (244, 143, 133))
+    text('FIELD COMMS', 946, 636, 14, GREEN)
+    y = 659
     for line in game.logs[-2:]:
         words, current = line.split(), ''
         for word in words:
@@ -296,13 +379,18 @@ def draw_menu():
         menu_button('quit', 'QUIT  [ESC]', (355, 470, 490, 44))
     elif screen_state == 'briefing':
         text('MISSION BRIEFING', 319, 290, 24, GREEN)
-        text('Find and evacuate all three students. Scout reveals threats and supplies.', 319, 332, 16, MUTED)
-        text('Fuel powers the Safe Zone generator before the final evacuation.', 319, 364, 16, MUTED)
-        text('CHOOSE DIFFICULTY', 319, 407, 14, MUTED)
+        model_status = (f"ML MODEL: trained on {adaptive_data['missions']} missions  |  Training fit: {adaptive_data['accuracy']:.0%}"
+                        if adaptive_data['trained'] else f"ML MODEL: collecting data ({adaptive_data['missions']}/15 missions)")
+        text(model_status, 319, 328, 13, MUTED)
+        text('ADAPTIVE: '+adaptive_plan['label']+' — '+adaptive_plan['reason'], 319, 353, 12, GREEN)
+        base_time = {'Easy': 300, 'Normal': 240, 'Hard': 180}[difficulty]
+        text(f"NEXT MISSION: Timer {base_time}s → {base_time + adaptive_plan['time']}s   |   Medkits 3 → {max(1, 3 + adaptive_plan['medkits'])}   |   Zombie HP 100 → {100 + adaptive_plan['zombie_hp']}", 319, 379, 12, INK)
+        text('Find and evacuate all three students. Fuel powers the final evacuation.', 319, 405, 14, MUTED)
+        text('CHOOSE DIFFICULTY', 319, 428, 14, MUTED)
         for index, label in enumerate(('Easy', 'Normal', 'Hard')):
-            menu_button('difficulty_'+label, label+('  ✓' if difficulty == label else ''), (319+index*170, 435, 150, 42), difficulty == label)
-        menu_button('deploy', 'DEPLOY TEAM  [ENTER]', (319, 515, 330, 48), True)
-        menu_button('back', 'BACK  [ESC]', (664, 515, 180, 48))
+            menu_button('difficulty_'+label, label+('  ✓' if difficulty == label else ''), (319+index*170, 453, 150, 38), difficulty == label)
+        menu_button('deploy', 'DEPLOY TEAM  [ENTER]', (319, 515, 330, 42), True)
+        menu_button('back', 'BACK  [ESC]', (664, 515, 180, 42))
     else:
         text('HOW TO PLAY', 319, 290, 24, GREEN)
         text('WASD moves the Commander. Press E to queue rescues.', 319, 332, 16, MUTED)
@@ -330,7 +418,7 @@ while running:
             elif screen_state == 'briefing' and event.key in (pygame.K_1, pygame.K_2, pygame.K_3):
                 difficulty = {pygame.K_1: 'Easy', pygame.K_2: 'Normal', pygame.K_3: 'Hard'}[event.key]
             elif screen_state == 'briefing' and event.key == pygame.K_RETURN:
-                game = Game(); game.time = {'Easy': 300, 'Normal': 240, 'Hard': 180}[difficulty]; last_log_message = game.logs[-1]; screen_state = 'game'
+                game = Game(); game.time = {'Easy': 300, 'Normal': 240, 'Hard': 180}[difficulty] + adaptive_plan['time']; game.medkits = max(1, game.medkits + adaptive_plan['medkits']); [setattr(zombie, 'hp', max(30, zombie.hp + adaptive_plan['zombie_hp'])) for zombie in game.zombies]; game.log('Adaptive setting: '+adaptive_plan['label']+'.'); last_log_message = game.logs[-1]; screen_state = 'game'
             elif screen_state != 'game':
                 continue
             elif event.key == pygame.K_m:
@@ -356,7 +444,7 @@ while running:
                         elif key == 'howto': screen_state = 'howto'
                         elif key == 'quit': running = False
                         elif key == 'back': screen_state = 'menu'
-                        elif key == 'deploy': game = Game(); game.time = {'Easy': 300, 'Normal': 240, 'Hard': 180}[difficulty]; last_log_message = game.logs[-1]; screen_state = 'game'
+                        elif key == 'deploy': game = Game(); game.time = {'Easy': 300, 'Normal': 240, 'Hard': 180}[difficulty] + adaptive_plan['time']; game.medkits = max(1, game.medkits + adaptive_plan['medkits']); [setattr(zombie, 'hp', max(30, zombie.hp + adaptive_plan['zombie_hp'])) for zombie in game.zombies]; game.log('Adaptive setting: '+adaptive_plan['label']+'.'); last_log_message = game.logs[-1]; screen_state = 'game'
                         elif key.startswith('difficulty_'): difficulty = key.removeprefix('difficulty_')
             elif not paused:
                 mx, my = event.pos
