@@ -45,12 +45,30 @@ if args.preview_game:
     screen_state = 'game'
 ASSET_ROOT = Path(__file__).parent / 'assets' / 'kenney-top-down-shooter'
 REALISTIC_MAP_PATH = Path(__file__).parent / 'assets' / 'generated' / 'campus-game-map-v4.png'
+GENERATED_CHARACTER_ROOT = Path(__file__).parent / 'assets' / 'generated'
 
 
 def load_asset(relative_path, size=None):
     """Load a transparent pack image once, optionally at game-grid scale."""
     image = pygame.image.load(ASSET_ROOT / relative_path).convert_alpha()
     return pygame.transform.smoothscale(image, size) if size else image
+
+
+def load_generated_character(filename, height=56):
+    """Load an original rendered character cutout, cropping its transparent canvas.
+
+    The source artwork is deliberately high resolution.  Cropping before scaling
+    keeps the actual character sharp and large enough to read over the campus map.
+    """
+    image = pygame.image.load(GENERATED_CHARACTER_ROOT / filename).convert_alpha()
+    parts = pygame.mask.from_surface(image).get_bounding_rects()
+    if parts:
+        # The largest connected region is the character; tiny isolated pixels are
+        # anti-aliasing remnants at the edge of the generated transparent canvas.
+        bounds = max(parts, key=lambda item: item.width * item.height)
+        image = image.subsurface(bounds).copy()
+    width = max(18, round(image.get_width() * height / image.get_height()))
+    return pygame.transform.smoothscale(image, (width, height))
 
 
 def make_tone(frequency, duration, volume=.22):
@@ -98,13 +116,15 @@ GRASS = load_asset('PNG/Tiles/tile_01.png', (TILE, TILE))
 REALISTIC_CAMPUS = (pygame.transform.smoothscale(pygame.image.load(REALISTIC_MAP_PATH).convert(), (COLS*TILE, ROWS*TILE))
                     if REALISTIC_MAP_PATH.exists() else None)
 ACTOR_IMAGES = {
-    'Leader': load_asset('PNG/Man Blue/manBlue_stand.png'),
-    'Rescuer': load_asset('PNG/Soldier 1/soldier1_hold.png'),
-    'Medic': load_asset('PNG/Man Old/manOld_hold.png'),
-    'Defender': load_asset('PNG/Hitman 1/hitman1_hold.png'),
-    'Scout': load_asset('PNG/Survivor 1/survivor1_hold.png'),
-    'Student': load_asset('PNG/Man Brown/manBrown_stand.png'),
-    'Zombie': load_asset('PNG/Zombie 1/zoimbie1_hold.png'),
+    # Each specialist has a distinct silhouette and role equipment, so the player
+    # can identify the team on the map before reading their name label.
+    'Leader': load_generated_character('leader-3d.png'),
+    'Rescuer': load_generated_character('rescuer-3d.png'),
+    'Medic': load_generated_character('medic-3d.png'),
+    'Defender': load_generated_character('defender-3d.png'),
+    'Scout': load_generated_character('scout-3d.png'),
+    'Student': load_generated_character('student-3d.png', 54),
+    'Zombie': load_generated_character('zombie-3d.png', 58),
 }
 
 
@@ -281,7 +301,7 @@ def draw_actor(a):
         pygame.draw.circle(screen, (244, 195, 109), (x, y+5), 24, 2)
         text('YOU', x-12, y-39, 12, (244, 195, 109))
     if not a.alive:
-        body = pygame.transform.smoothscale(ACTOR_IMAGES[a.role], (36, 26))
+        body = pygame.transform.smoothscale(ACTOR_IMAGES[a.role], (32, 22))
         body.set_alpha(125)
         screen.blit(body, body.get_rect(center=(x, y+5)))
         pygame.draw.line(screen, (229, 87, 82), (x-16, y-9), (x+16, y+12), 2)
@@ -300,17 +320,17 @@ def draw_actor(a):
         pygame.draw.circle(screen, (119, 130, 112), (x+9, y+11), 2)
     if a.role == 'Rescuer' and selected:
         pygame.draw.circle(screen, (245, 201, 120), (x, y), 21, 2)
-    # The source Scout art is asymmetrical; rotating it at tiny steering changes
-    # makes it visibly flicker. Keep a consistent top-down orientation instead.
-    angle = 0 if a.role == 'Scout' else round(math.degrees(math.atan2(a.facing[1], a.facing[0])) / 90) * 90 - 90
-    body = pygame.transform.rotate(ACTOR_IMAGES[a.role], angle)
+    # The rendered characters are upright 3D cutouts.  The former Kenney sprites
+    # were top-down and needed directional rotation; applying that rule here made
+    # people appear to lie down whenever they moved sideways.
+    body = ACTOR_IMAGES[a.role]
     if a.flash:
         body = body.copy()
         body.fill((105, 105, 105, 0), special_flags=pygame.BLEND_RGB_ADD)
     # The Scout frequently pauses to scan a sector. Keep that scan pose stable
     # so it never looks like it is vibrating while waiting for new information.
     bob = int(math.sin(game.elapsed * 14) * 2) if a.moving and a.role != 'Scout' else 0
-    screen.blit(body, body.get_rect(center=(x, y + bob)))
+    screen.blit(body, body.get_rect(midbottom=(x, y + 16 + bob)))
     if a.role == 'Rescuer':
         pygame.draw.circle(screen, (252, 233, 187), (x, y + bob), 3)
     rect((22, 32, 34), (x-17, y-28, 34, 4), 2)

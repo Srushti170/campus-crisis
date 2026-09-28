@@ -68,12 +68,22 @@ class MissionTests(unittest.TestCase):
         game = Game(seed=7, player_role='Defender')
         for zombie in game.zombies[1:]:
             zombie.hp = 0
+        game.defender.x, game.defender.y = center((10, 16))
         game.zombie.x, game.zombie.y = game.defender.x + 20, game.defender.y
         before = game.defender.hp
         game.update(1 / 60)
         self.assertEqual(game.zombie.target_name, game.defender.name)
         self.assertEqual(game.zombie.state, 'Attack')
         self.assertLess(game.defender.hp, before)
+
+    def test_safe_zone_prevents_zombie_damage_to_the_leader(self):
+        game = Game(seed=7, player_role='Rescuer')
+        game.leader.x, game.leader.y = center((5, 18))
+        game.zombie.x, game.zombie.y = game.leader.x + 20, game.leader.y
+        before = game.leader.hp
+        game.update(1 / 60)
+        self.assertEqual(game.leader.hp, before)
+        self.assertNotEqual(game.zombie.state, 'Attack')
 
     def test_downed_defender_stays_in_place(self):
         game = Game(seed=7)

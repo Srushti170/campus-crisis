@@ -14,6 +14,10 @@ SAFE=(3,17,5,3)
 LANDMARKS=[('CLINIC',(10,12,2,2),'medkit'),('SECURITY',(25,5,2,3),'ammo'),('GENERATOR',(10,17,2,2),'fuel'),('PARKING',(22,1,5,4),'parking')]
 def center(c): return ((c[0]+.5)*TILE,(c[1]+.5)*TILE)
 def cell(p): return (int(p[0]//TILE),int(p[1]//TILE))
+def in_safe_zone(p):
+    """Return whether a world position is inside the evacuation sanctuary."""
+    x,y=cell(p)
+    return SAFE[0] <= x < SAFE[0]+SAFE[2] and SAFE[1] <= y < SAFE[1]+SAFE[3]
 def walkable(p):
     """Outdoor campus routes; the fenced map edge and buildings are inaccessible."""
     x, y = p
@@ -317,15 +321,22 @@ class Game:
         if not z.alive or z.stun:
             z.target_name=''
             return
+        # The Safe Zone is a guarded sanctuary, not merely the visual point where
+        # students are dropped off. A zombie may never deal damage to anybody in
+        # it, and it abandons a stale chase that would take it into the sanctuary.
+        if in_safe_zone(z.pos):
+            z.target_name=''; z.last_seen=None; z.search_time=0; z.state='Retreat'
+            self.navigate(z,center((SAFE[0]+SAFE[2]+1, SAFE[1]+SAFE[3]//2)),66,dt,8)
+            return
         # Waiting students are concealed in their classrooms. Once a Rescuer makes
         # contact they become an exposed escort target, creating rescue risk
         # without allowing an unseen patrol to end the mission immediately.
-        targets=[a for a in (self.leader,self.rescuer,*self.students) if a.alive and a.state!='Rescued' and (a.role != 'Student' or a.state == 'Following') and math.dist(z.pos,a.pos)<(245 if sprint and a is self.leader else 185) and self.visible(z.pos,a.pos)]
+        targets=[a for a in (self.leader,self.rescuer,*self.students) if a.alive and a.state!='Rescued' and not in_safe_zone(a.pos) and (a.role != 'Student' or a.state == 'Following') and math.dist(z.pos,a.pos)<(245 if sprint and a is self.leader else 185) and self.visible(z.pos,a.pos)]
         defender_is_player = self.player_role=='Defender'
         defender_engaging = self.defender_target is z and self.defender.state=='Engage'
         # A player Defender is a valid threat target whenever they approach a
         # zombie, even before shooting. AI Defenders are targeted on engagement.
-        if self.defender.alive and (defender_engaging or defender_is_player) and math.dist(z.pos,self.defender.pos)<185 and self.visible(z.pos,self.defender.pos):
+        if self.defender.alive and not in_safe_zone(self.defender.pos) and (defender_engaging or defender_is_player) and math.dist(z.pos,self.defender.pos)<185 and self.visible(z.pos,self.defender.pos):
             targets.append(self.defender)
         if targets:
             # An exposed escorted student is the highest-value target. This makes
@@ -340,12 +351,13 @@ class Game:
                     if not t.alive:
                         z.target_name=''; z.last_seen=None; z.search_time=0; z.state='Patrol'
             else:z.state='Chase';self.navigate(z,t.pos,76,dt,20)
-        elif z.last_seen:
+        elif z.last_seen and not in_safe_zone(z.last_seen):
             z.target_name=''
             z.state='Search';self.navigate(z,z.last_seen,66,dt);z.search_time-=dt
             if z.search_time<=0:z.last_seen=None
         else:
             z.target_name=''
+            z.last_seen=None
             z.state='Patrol';pts=[(25,10),(25,2),(14,2),(14,10)];dest=center(pts[(z.patrol+self.zombies.index(z))%4]);self.navigate(z,dest,48,dt)
             if math.dist(z.pos,dest)<6:z.patrol=(z.patrol+1)%4
     def update(self,dt,movement=(0,0),sprint=False):
