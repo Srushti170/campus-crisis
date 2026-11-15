@@ -3611,5 +3611,37 @@
     "students_required": 5,
     "zombies_deployed": 6,
     "fuel_required": 1
+  },
+  {
+    "students_rescued": 5,
+    "zombies_neutralized": 1,
+    "medkits_used": 3,
+    "damage_taken": 0,
+    "task_changes": 63,
+    "outcome": "Mission complete",
+    "time_remaining": 179.3,
+    "fuel": 0,
+    "ammo": 0,
+    "mission": "Campus Evacuation",
+    "sector": 3,
+    "students_required": 5,
+    "zombies_deployed": 5,
+    "fuel_required": 1
+  },
+  {
+    "students_rescued": 4,
+    "zombies_neutralized": 3,
+    "medkits_used": 3,
+    "damage_taken": 0,
+    "task_changes": 43,
+    "outcome": "Mission complete",
+    "time_remaining": 183.0,
+    "fuel": 0,
+    "ammo": 5,
+    "mission": "Campus Evacuation",
+    "sector": 1,
+    "students_required": 4,
+    "zombies_deployed": 3,
+    "fuel_required": 1
   }
 ]

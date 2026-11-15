@@ -4,8 +4,9 @@ from unittest import mock
 import pygame
 from adaptive import train
 from fog import ALL_CELLS, BUILDING_FOOTPRINTS, CloudFog, FogField, visual_clear_cells
+from sprites import GAME_HEIGHT, DEFAULT_HEIGHT, ROLES, build_character_sprites
 from world import (Game, WALLS, SAFE, ROWS, COLS, TILE, LANDMARKS, ZOMBIE_PATROL, SCOUT_EVADE_RANGE,
-                   center, cell, pathfind, walkable)
+                   SAFE_KEEP_OUT, center, cell, in_safe_zone, pathfind, safe_gap, walkable)
 
 class MissionTests(unittest.TestCase):
     def test_ml_model_trains_after_fifteen_completed_missions(self):
@@ -28,7 +29,7 @@ class MissionTests(unittest.TestCase):
     def test_generated_mission_has_expanded_team_and_threats(self):
         game = Game(seed=7)
         self.assertIn(len(game.students), (4, 5))
-        self.assertIn(len(game.zombies), (4, 5))
+        self.assertIn(len(game.zombies), (3, 4))
         self.assertEqual(len(game.pickups), 6)
         self.assertGreaterEqual(game.time, 270)
         self.assertEqual(game.rescued_count, 0)
@@ -90,6 +91,99 @@ class MissionTests(unittest.TestCase):
         self.assertEqual(game.leader.hp, before)
         self.assertNotEqual(game.zombie.state, 'Attack')
 
+    def test_each_sector_has_one_fewer_zombie_than_before(self):
+        for sector, (low, high) in ((1, (3, 4)), (2, (4, 5)), (3, (5, 6))):
+            counts = {len(Game(seed=seed, campaign_level=sector).zombies) for seed in range(40)}
+            self.assertEqual((min(counts), max(counts)), (low, high), sector)
+
+    def test_zombie_health_bar_scale_matches_its_tougher_sectors(self):
+        game = Game(seed=7, campaign_level=3)
+        self.assertEqual(game.max_hp(game.zombie), 124)
+        self.assertEqual(game.zombie.hp, 124)
+        self.assertEqual(game.max_hp(game.rescuer), 100)
+
+    def test_neutralized_zombie_fades_away_in_two_seconds(self):
+        game = Game(seed=7)
+        zombie = game.zombie
+        zombie.hp = 0
+        game.update(1 / 60)
+        self.assertAlmostEqual(game.corpse_fade(zombie), 1.0, places=1)
+        for _ in range(60):
+            game.update(1 / 60)
+        self.assertAlmostEqual(game.corpse_fade(zombie), 0.5, places=1)
+        for _ in range(61):
+            game.update(1 / 60)
+        self.assertEqual(game.corpse_fade(zombie), 0.0)
+
+    def test_nobody_jumps_aside_when_you_walk_past(self):
+        # Characters only ever walk; none is shoved sideways when another passes.
+        game = Game(seed=7, player_role='Defender')
+        game.defender.x, game.defender.y = center((2, 18))
+        fastest = 158 / 60 + 0.01  # a sprinting player covers the most ground per frame
+        last = {a.name: a.pos for a in game.actors}
+        for frame in range(60 * 6):
+            game.update(1 / 60, movement=(1, 0) if frame < 60 * 3 else (-1, 0))  # through the team and back
+            for actor in game.actors:
+                self.assertLessEqual(math.dist(actor.pos, last[actor.name]), fastest, actor.name)
+                last[actor.name] = actor.pos
+
+    def test_names_show_for_you_students_calling_for_help_and_zombie_targets(self):
+        game = Game(seed=7, player_role='Medic')
+        self.assertTrue(game.named_on_map(game.medic))  # you
+        self.assertTrue(game.named_on_map(game.student))  # waiting for rescue
+        self.assertFalse(game.named_on_map(game.scout))
+        game.zombie.target_name = game.scout.name
+        self.assertTrue(game.named_on_map(game.scout))  # hunted
+
+    def test_zombie_cannot_walk_into_the_safe_zone(self):
+        game = Game(seed=7)
+        zombie = game.zombie
+        zombie.x, zombie.y = center((10, 18))
+        for _ in range(120):
+            game.move(zombie, -3, 0)  # keep pushing west towards the Safe Zone gate
+        self.assertFalse(in_safe_zone(zombie.pos))
+        self.assertGreaterEqual(safe_gap(zombie.pos), SAFE_KEEP_OUT)
+        rescuer = game.rescuer
+        rescuer.x, rescuer.y = center((10, 18))
+        for _ in range(60):
+            game.move(rescuer, -3, 0)
+        self.assertTrue(in_safe_zone(rescuer.pos))  # the team walks straight in
+
+    def test_zombie_gives_up_when_its_prey_reaches_the_safe_zone(self):
+        game = Game(seed=7, player_role='Rescuer')
+        for zombie in game.zombies[1:]:
+            zombie.hp = 0
+        for defender in game.defenders:
+            defender.hp = 0  # nobody shoots the zombie during the check
+        zombie, student, earlier = game.zombie, game.students[0], game.students[1]
+        earlier.state = 'Rescued'; earlier.x, earlier.y = center((8, 17))  # standing by the gate
+        student.state = 'Following'; game.escort_student = student
+        game.rescuer.x, game.rescuer.y = center((13, 18))
+        student.x, student.y = center((14, 18))
+        zombie.x, zombie.y = center((17, 18))
+        states_after_rescue = []
+        for _ in range(60 * 8):
+            walking = (-1, 0) if cell(game.rescuer.pos)[0] > 4 else (0, 0)
+            game.update(1 / 60, movement=walking)
+            self.assertFalse(in_safe_zone(zombie.pos))
+            if student.state == 'Rescued':
+                states_after_rescue.append(zombie.state)
+        self.assertEqual(student.state, 'Rescued')
+        self.assertNotIn('Search', states_after_rescue)  # no waiting at the gate
+        self.assertEqual(states_after_rescue[0], 'Patrol')
+        self.assertGreater(safe_gap(zombie.pos), 4 * TILE)  # it went off to look elsewhere
+
+    def test_zombie_does_not_search_right_outside_the_safe_zone(self):
+        game = Game(seed=7)
+        for zombie in game.zombies[1:]:
+            zombie.hp = 0
+        zombie = game.zombie
+        zombie.x, zombie.y = center((11, 18))
+        zombie.last_seen, zombie.search_time = center((8, 18)), 3  # someone slipped through the gate
+        game.update(1 / 60)
+        self.assertEqual(zombie.state, 'Patrol')
+        self.assertIsNone(zombie.last_seen)
+
     def test_downed_defender_stays_in_place(self):
         game = Game(seed=7)
         game.defender.hp = 0
@@ -129,7 +223,19 @@ class MissionTests(unittest.TestCase):
         targets = {game.defender_targets[d.name].name for d in game.defenders}
         self.assertEqual(targets, {first.name, second.name})
 
-    def test_second_defender_covers_the_rescuer_when_no_zombie_is_sighted(self):
+    def test_second_defender_covers_the_rescuer_while_a_zombie_is_at_large(self):
+        game = Game(seed=7)
+        for zombie in game.zombies[1:]:
+            zombie.hp = 0
+        game.zombie.x, game.zombie.y = center((24, 3))  # alive, far away and not yet sighted
+        game.rescuer.x, game.rescuer.y = center((12, 11))
+        game.command('Hold')
+        game.update(1 / 30)
+        self.assertFalse(game.discovered[game.zombie.name])
+        self.assertEqual(game.defender.task, 'Guard Safe Zone')
+        self.assertEqual(game.defender2.task, 'Cover Rescuer')
+
+    def test_defenders_stand_down_once_every_zombie_is_dead(self):
         game = Game(seed=7)
         for zombie in game.zombies:
             zombie.hp = 0
@@ -137,7 +243,7 @@ class MissionTests(unittest.TestCase):
         game.command('Hold')
         game.update(1 / 30)
         self.assertEqual(game.defender.task, 'Guard Safe Zone')
-        self.assertEqual(game.defender2.task, 'Cover Rescuer')
+        self.assertEqual(game.defender2.task, 'Guard Safe Zone')  # no longer trails the Rescuer
 
     def test_full_generated_mission_completes(self):
         game = Game(seed=7); game.command('Rescue')
@@ -170,6 +276,7 @@ class MissionTests(unittest.TestCase):
     def test_zombie_attacks_student_during_escort(self):
         game = Game(seed=7); student = game.student
         student.state = 'Following'; game.escort_student = student
+        student.x, student.y = center((12, 11))  # open road, whatever the random layout
         game.zombie.x, game.zombie.y = student.x + 20, student.y
         before = student.hp; game.update(1/60)
         self.assertEqual(game.zombie.state, 'Attack')
@@ -423,6 +530,19 @@ class MissionTests(unittest.TestCase):
             self.assertEqual(game.zombie.state, 'Patrol')
             self.assertEqual(game.zombie.patrol, 1)
 
+    def test_no_road_tile_can_be_left_in_fog_after_search_complete(self):
+        # Sixteen west-side road tiles, (1,11)-(7,12) and (17,11)-(18,12), used to
+        # lie outside every Scout sector: with only them still fogged, the Scout
+        # saw no remaining fog and reported "search complete".
+        game = Game(seed=7)
+        everything = {(x, y) for y in range(ROWS) for x in range(COLS)}
+        missed = []
+        for tile in (c for c in sorted(everything) if walkable(c)):
+            game.revealed = everything - {tile}
+            if max(game.scout_unseen_coverage(point) for point in game.scout_points) == 0:
+                missed.append(tile)
+        self.assertEqual(missed, [])
+
     def test_scout_sweeps_the_whole_campus_and_reports_back(self):
         game = Game(seed=4)
         game.command('Hold')  # keep the mission running while the Scout searches
@@ -436,6 +556,38 @@ class MissionTests(unittest.TestCase):
         unsearched = [c for c in ALL_CELLS if walkable(c) and c not in game.revealed]
         self.assertEqual(unsearched, [])
         self.assertEqual([c for c in ALL_CELLS if c not in visual_clear_cells(game.revealed)], [])
+
+
+class SpriteTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.sprites = build_character_sprites()
+
+    def test_every_role_has_standing_and_walking_frames_at_game_size(self):
+        self.assertEqual(set(self.sprites), set(ROLES))
+        for role, sides in self.sprites.items():
+            for side in ('right', 'left'):
+                frames = sides[side]
+                self.assertEqual(len(frames), 3, role)
+                self.assertEqual({f.get_size() for f in frames}, {frames[0].get_size()}, role)  # no jitter between frames
+                self.assertEqual(frames[0].get_height(), GAME_HEIGHT.get(role, DEFAULT_HEIGHT), role)
+
+    def test_feet_stay_on_the_ground_while_walking(self):
+        for role, sides in self.sprites.items():
+            for frame in sides['right']:
+                bottom = frame.get_height() - 1
+                self.assertTrue(any(frame.get_at((x, bottom)).a > 24 for x in range(frame.get_width())), role)
+
+    def test_walking_frames_actually_move_the_legs(self):
+        for role, sides in self.sprites.items():
+            standing, left_step, right_step = (pygame.image.tobytes(f, 'RGBA') for f in sides['right'])
+            self.assertNotEqual(standing, left_step, role)
+            self.assertNotEqual(left_step, right_step, role)
+
+    def test_left_facing_frames_mirror_the_right_facing_ones(self):
+        for role, sides in self.sprites.items():
+            mirrored = pygame.transform.flip(sides['right'][0], True, False)
+            self.assertEqual(pygame.image.tobytes(mirrored, 'RGBA'), pygame.image.tobytes(sides['left'][0], 'RGBA'), role)
 
 
 class FogTests(unittest.TestCase):

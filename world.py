@@ -23,12 +23,24 @@ SCOUT_EVADE_RANGE=64    # px: a visible zombie this close makes the Scout sidest
 SCOUT_SAFE_RANGE=112    # px: the sidestep ends once that zombie is this far away
 SCOUT_EVADE_TIME=1.2    # s: longest a single sidestep lasts
 SCOUT_RETRY_TIME=5.0    # s: met the same zombie again this soon, the Scout runs past it
+# Readability: a neutralized zombie's body fades away over ZOMBIE_FADE_TIME.
+ZOMBIE_FADE_TIME=2.0
 def center(c): return ((c[0]+.5)*TILE,(c[1]+.5)*TILE)
 def cell(p): return (int(p[0]//TILE),int(p[1]//TILE))
 def in_safe_zone(p):
     """Return whether a world position is inside the evacuation sanctuary."""
     x,y=cell(p)
     return SAFE[0] <= x < SAFE[0]+SAFE[2] and SAFE[1] <= y < SAFE[1]+SAFE[3]
+# Zombies never cross into the Safe Zone. They stay at least SAFE_KEEP_OUT px
+# from its edge, never plan a route through it, and never search for prey right
+# outside it: a survivor who reaches the Safe Zone has escaped.
+SAFE_KEEP_OUT=16
+SAFE_SEARCH_GAP=2*TILE
+ZOMBIE_NO_GO={(x,y):math.inf for x in range(SAFE[0],SAFE[0]+SAFE[2]) for y in range(SAFE[1],SAFE[1]+SAFE[3])}
+def safe_gap(p):
+    """Pixel distance from a world position to the Safe Zone (0 inside it)."""
+    x0,y0=SAFE[0]*TILE,SAFE[1]*TILE; x1,y1=x0+SAFE[2]*TILE,y0+SAFE[3]*TILE
+    return math.hypot(max(x0-p[0],0,p[0]-x1),max(y0-p[1],0,p[1]-y1))
 def walkable(p):
     """Outdoor campus routes; the fenced map edge and buildings are inaccessible."""
     x, y = p
@@ -74,9 +86,9 @@ class Game:
         # Defender-1 and Defender-2 stays an AI partner; otherwise both are AI.
         self.defender2=Actor(*center((7,18)),'Defender','Defender-2'); self.defenders=[self.defender,self.defender2]
         missions=(
-            {'title':'Campus Evacuation','students':4,'zombies':4,'time':300,'fuel':1,'objective':'Locate and evacuate every stranded student.'},
-            {'title':'Emergency Power','students':4,'zombies':4,'time':270,'fuel':2,'objective':'Restore generator fuel, then evacuate every student.'},
-            {'title':'Mass Rescue','students':5,'zombies':5,'time':330,'fuel':1,'objective':'Evacuate all students before the outbreak spreads.'},
+            {'title':'Campus Evacuation','students':4,'zombies':3,'time':300,'fuel':1,'objective':'Locate and evacuate every stranded student.'},
+            {'title':'Emergency Power','students':4,'zombies':3,'time':270,'fuel':2,'objective':'Restore generator fuel, then evacuate every student.'},
+            {'title':'Mass Rescue','students':5,'zombies':4,'time':330,'fuel':1,'objective':'Evacuate all students before the outbreak spreads.'},
         )
         base_mission=self.random.choice(missions)
         sector_pressure=self.campaign_level-1
@@ -128,12 +140,14 @@ class Game:
         for tile in ((x,y) for y in range(ROWS) for x in range(COLS) if walkable((x,y))):
             if all(math.dist(tile,point)>3.6 for point in scout_points): scout_points.append(tile)
         self.time=float(self.mission['time']); self.elapsed=0.; self.result=None; self.order='Follow' if player_role=='Commander' else 'Rescue'; self.escort_student=None; self.defender_targets={}; self.medkits=max(1,3-sector_pressure); self.ammo=20; self.fuel=0; self.fuel_required=self.mission['fuel']; self.shove_cooldown=0; self.routes={}; self.scout_points=scout_points; self.scout_point=0; self.revealed=set()
-        for zombie in self.zombies: zombie.hp += sector_pressure*12
+        self.zombie_max_hp=100+sector_pressure*12
+        for zombie in self.zombies: zombie.hp=self.zombie_max_hp
         self.discovered={'Student':False,'Zombie':False,**{a.name:False for a in (*self.students,*self.zombies)}}; self.reveal(self.leader.pos,2.5); self.reveal(self.scout.pos,3); self.logs=[self.mission['title']+': '+self.mission['objective'],'Scout: searching unexplored campus sectors.','Queue the rescue order with E.']
         self.stats={'students_rescued':0,'zombies_neutralized':0,'medkits_used':0,'damage_taken':0,'task_changes':0}
         # Scout evasion state: the zombie being sidestepped, where to, and when
         # the Scout last backed away from each zombie.
         self.scout_threat=None; self.scout_escape=None; self.scout_evaded={}
+        self.down_at={}  # zombie name -> mission time it was neutralized (its body then fades)
     @property
     def rescued_count(self): return sum(s.state=='Rescued' for s in self.students)
     def log(self,msg): self.logs=(self.logs+[msg])[-8:]  # room for every agent's first-frame report
@@ -194,10 +208,22 @@ class Game:
     def discover(self,a,msg):
         if not self.discovered[a.name]: self.discovered[a.name]=True; self.discovered[a.role]=True; self.log('Scout: '+msg)
     def clear_at(self,x,y): return all(walkable(cell((x+dx,y+dy))) for dx in (-9,9) for dy in (-9,9))
+    def max_hp(self,a): return self.zombie_max_hp if a.role=='Zombie' else 100
+    def corpse_fade(self,z):
+        """Opacity of a neutralized zombie's body: 1 when it falls, 0 (gone) after ZOMBIE_FADE_TIME."""
+        return max(0.,1-(self.elapsed-self.down_at.get(z.name,self.elapsed))/ZOMBIE_FADE_TIME)
+    def named_on_map(self,a):
+        """Whose name the map always shows: yours, a student calling for help,
+        and anybody a zombie is hunting. Everyone else is named on request."""
+        return a is self.controlled_actor() or (a.role=='Student' and a.state=='Waiting') or any(z.alive and z.target_name==a.name for z in self.zombies)
+    def fenced_out(self,a,x,y):
+        """A zombie may not step closer than SAFE_KEEP_OUT to the Safe Zone
+        (stepping away from it is always allowed)."""
+        return a.role=='Zombie' and safe_gap((x,y))<SAFE_KEEP_OUT and safe_gap((x,y))<safe_gap(a.pos)
     def move(self,a,dx,dy):
         before=a.pos
-        if self.clear_at(a.x+dx,a.y):a.x+=dx
-        if self.clear_at(a.x,a.y+dy):a.y+=dy
+        if self.clear_at(a.x+dx,a.y) and not self.fenced_out(a,a.x+dx,a.y):a.x+=dx
+        if self.clear_at(a.x,a.y+dy) and not self.fenced_out(a,a.x,a.y+dy):a.y+=dy
         # Ignore sub-pixel collision corrections so an idle agent does not keep
         # triggering the walk animation and appear to vibrate in place.
         a.moving=math.dist(before,a.pos)>.25
@@ -394,9 +420,11 @@ class Game:
                 if not d.cooldown and self.ammo:z.hp=max(0,z.hp-14);self.ammo-=1;z.flash=.25;d.cooldown=.58;self.stats['zombies_neutralized']+=int(not z.alive);self.log(f'{d.name}: {z.name} neutralized.' if not z.alive else f'{d.name}: engaging {z.name}.')
             return
         self.defender_targets.pop(d.name,None)
-        if d is self.defender2 and self.rescuer.alive and not in_safe_zone(self.rescuer.pos):
-            # With no threat in sight, the second Defender shadows the Rescuer in
-            # the field instead of stacking up beside the first at the Safe Zone.
+        zombies_at_large=any(z.alive for z in self.zombies)
+        if d is self.defender2 and zombies_at_large and self.rescuer.alive and not in_safe_zone(self.rescuer.pos):
+            # While a zombie is still at large but out of sight, the second
+            # Defender shadows the Rescuer in the field. Once every zombie is
+            # down there is nothing to cover against, so it stands down.
             self.assign(d,'Cover Rescuer',self.task_score(20,45,math.dist(d.pos,self.rescuer.pos)),'covering the Rescuer in the field')
             self.navigate(d,self.rescuer.pos,104,dt,48)
         else:
@@ -415,6 +443,13 @@ class Game:
             z.target_name=''; z.last_seen=None; z.search_time=0; z.state='Retreat'
             self.navigate(z,center((SAFE[0]+SAFE[2]+1, SAFE[1]+SAFE[3]//2)),66,dt,8)
             return
+        # Prey that reached the Safe Zone (or was evacuated) has escaped. The
+        # zombie forgets it at once instead of waiting at the gate, and looks for
+        # another target or goes back on patrol.
+        if z.target_name:
+            prey=next((a for a in self.actors if a.name==z.target_name),None)
+            if prey is None or not prey.alive or prey.state=='Rescued' or in_safe_zone(prey.pos):
+                z.target_name=''; z.last_seen=None; z.search_time=0
         # Waiting students are concealed in their classrooms. Once a Rescuer makes
         # contact they become an exposed escort target, creating rescue risk
         # without allowing an unseen patrol to end the mission immediately.
@@ -440,17 +475,17 @@ class Game:
                     t.hp=max(0,t.hp-6);t.flash=.3;z.cooldown=.75
                     if not t.alive:
                         z.target_name=''; z.last_seen=None; z.search_time=0; z.state='Patrol'
-            else:z.state='Chase';self.navigate(z,t.pos,76,dt,20)
-        elif z.last_seen and not in_safe_zone(z.last_seen):
+            else:z.state='Chase';self.navigate(z,t.pos,76,dt,20,ZOMBIE_NO_GO)
+        elif z.last_seen and safe_gap(z.last_seen)>SAFE_SEARCH_GAP:
             z.target_name=''
-            z.state='Search';self.navigate(z,z.last_seen,66,dt);z.search_time-=dt
+            z.state='Search';self.navigate(z,z.last_seen,66,dt,5,ZOMBIE_NO_GO);z.search_time-=dt
             if z.search_time<=0:z.last_seen=None
         else:
             z.target_name=''
             z.last_seen=None
             z.state='Patrol'
             dest=center(ZOMBIE_PATROL[(z.patrol+self.zombies.index(z))%len(ZOMBIE_PATROL)])
-            self.navigate(z,dest,48,dt)
+            self.navigate(z,dest,48,dt,5,ZOMBIE_NO_GO)
             # Advance on arrival, and never stall on a waypoint A* cannot reach:
             # a zombie with no route moves on to the next stop instead of freezing.
             unreachable=cell(z.pos)!=cell(dest) and not self.routes.get(z.name)
@@ -476,6 +511,8 @@ class Game:
         for defender in self.defenders:
             if defender is not player:self.defender_ai(defender,dt)
         for z in self.zombies:self.zombie_ai(z,dt,sprint)
+        for z in self.zombies:
+            if not z.alive:self.down_at.setdefault(z.name,self.elapsed)
         if any(not s.alive for s in self.students):self.result='Student lost'
         elif not self.leader.alive or not self.rescuer.alive:self.result='Rescue team lost'
         elif self.time<=0:self.result='Time expired'

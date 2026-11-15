@@ -36,7 +36,9 @@ py -m venv .venv
 | H | Selected Rescuer holds position |
 | P | Pause / resume |
 | F3 | Toggle AI paths and state labels |
+| Alt (hold) | Show every character's name (normally only yours, students calling for help and zombie targets) |
 | R | Restart |
+| F11 | Switch between fullscreen (the default) and a resizable window |
 | Esc | Quit |
 
 The Rescuer starts selected. Press E to dispatch, then head east along the
@@ -62,7 +64,8 @@ risk`, displayed in **AI TASK ALLOCATION** on the right side of the game.
   zombie's attention away from the rescue party. They split up: each takes a
   zombie the other is not already fighting, and only double up when every
   sighted zombie is covered. With nothing in sight, Defender 1 guards the Safe
-  Zone and Defender 2 covers the Rescuer in the field. If you play the
+  Zone and Defender 2 covers the Rescuer in the field while any zombie is still
+  at large; once every zombie is down, both stand guard. If you play the
   Defender role you control Defender 1 and Defender 2 stays an AI partner.
 
 ## Verify
@@ -81,11 +84,15 @@ search, orders, and mission failure. They do not replace human playtesting.
 
 - `world.py`: deterministic simulation, A*, collision and line-of-sight checks,
   zombie states and rescue/follow/hold behavior. No rendering dependency.
-- `main.py`: desktop window, input, Kenney asset rendering, animation, HUD and overlays.
-- `test_game.py`: automated simulation tests.
+- `main.py`: desktop window, input, rendering, animation, HUD and overlays.
+- `sprites.py`: the painted semi-realistic characters, drawn in code (standing
+  and two walking frames per role, mirrored to face either way).
+- `fog.py`: the drifting cloud fog over unscouted campus.
+- `test_game.py`: automated simulation, fog and sprite tests.
 
-The game uses the CC0-licensed **Topdown (Shooter) Pack** by Kenney for its
-team, student, zombie and ground artwork. The original downloaded ZIP is in
+The characters are drawn entirely in code by `sprites.py`, so they need no
+image files. The game uses the CC0-licensed **Topdown (Shooter) Pack** by
+Kenney for its ground artwork. The original downloaded ZIP is in
 `assets/source/`, its extracted files are in `assets/kenney-top-down-shooter/`,
 and the license is preserved as `assets/LICENSE-KENNEY-TOP-DOWN-SHOOTER.txt`.
 See `CREDITS.md`. Pygame Community Edition supplies the `pygame` module.

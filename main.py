@@ -10,19 +10,30 @@ parser.add_argument('--smoke-test', action='store_true', help='Render 120 frames
 parser.add_argument('--screenshot', type=str, help='Save a frame and exit')
 parser.add_argument('--preview-game', action='store_true', help='Open directly into a mission for visual review')
 args = parser.parse_args()
-if args.smoke_test or args.screenshot:
+HEADLESS = bool(args.smoke_test or args.screenshot)
+if HEADLESS:
     os.environ['SDL_VIDEODRIVER'] = 'dummy'
     os.environ['SDL_AUDIODRIVER'] = 'dummy'
+else:
+    # Use the monitor's real pixels (Windows otherwise stretches a blurry
+    # low-resolution window under display scaling) and scale the canvas smoothly.
+    os.environ.setdefault('SDL_WINDOWS_DPI_AWARENESS', 'permonitorv2')
+    os.environ.setdefault('SDL_RENDER_SCALE_QUALITY', 'linear')
 import pygame
 from world import Game, TILE, COLS, ROWS, BUILDINGS, SAFE, LANDMARKS, center
 from fog import CloudFog
+from sprites import build_character_sprites
 from adaptive import recommend, report
 from campaign import load_progress, record_completion, reset_progress
 
 pygame.mixer.pre_init(44100, -16, 1, 512)
 pygame.init()
 WIDTH, HEIGHT = 1200, 760
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
+# The game is laid out on a fixed 1200x760 canvas. SCALED stretches it over the
+# whole monitor (or a resizable window) keeping its proportions, and maps mouse
+# clicks back onto the canvas. It starts fullscreen; F11 switches to a window.
+screen = (pygame.display.set_mode((WIDTH, HEIGHT)) if HEADLESS else
+          pygame.display.set_mode((WIDTH, HEIGHT), pygame.SCALED | pygame.RESIZABLE | pygame.FULLSCREEN))
 pygame.display.set_caption('Campus Crisis | First Response')
 clock = pygame.time.Clock()
 fonts = {size: pygame.font.SysFont('segoeui', size, bold=size >= 24) for size in (12, 13, 14, 16, 18, 24, 32, 48)}
@@ -46,30 +57,12 @@ if args.preview_game:
     screen_state = 'game'
 ASSET_ROOT = Path(__file__).parent / 'assets' / 'kenney-top-down-shooter'
 REALISTIC_MAP_PATH = Path(__file__).parent / 'assets' / 'generated' / 'campus-game-map-v4.png'
-GENERATED_CHARACTER_ROOT = Path(__file__).parent / 'assets' / 'generated'
 
 
 def load_asset(relative_path, size=None):
     """Load a transparent pack image once, optionally at game-grid scale."""
     image = pygame.image.load(ASSET_ROOT / relative_path).convert_alpha()
     return pygame.transform.smoothscale(image, size) if size else image
-
-
-def load_generated_character(filename, height=56):
-    """Load an original rendered character cutout, cropping its transparent canvas.
-
-    The source artwork is deliberately high resolution.  Cropping before scaling
-    keeps the actual character sharp and large enough to read over the campus map.
-    """
-    image = pygame.image.load(GENERATED_CHARACTER_ROOT / filename).convert_alpha()
-    parts = pygame.mask.from_surface(image).get_bounding_rects()
-    if parts:
-        # The largest connected region is the character; tiny isolated pixels are
-        # anti-aliasing remnants at the edge of the generated transparent canvas.
-        bounds = max(parts, key=lambda item: item.width * item.height)
-        image = image.subsurface(bounds).copy()
-    width = max(18, round(image.get_width() * height / image.get_height()))
-    return pygame.transform.smoothscale(image, (width, height))
 
 
 def make_tone(frequency, duration, volume=.22):
@@ -116,17 +109,19 @@ def reset_campaign():
 GRASS = load_asset('PNG/Tiles/tile_01.png', (TILE, TILE))
 REALISTIC_CAMPUS = (pygame.transform.smoothscale(pygame.image.load(REALISTIC_MAP_PATH).convert(), (COLS*TILE, ROWS*TILE))
                     if REALISTIC_MAP_PATH.exists() else None)
-ACTOR_IMAGES = {
-    # Each specialist has a distinct silhouette and role equipment, so the player
-    # can identify the team on the map before reading their name label.
-    'Leader': load_generated_character('leader-3d.png'),
-    'Rescuer': load_generated_character('rescuer-3d.png'),
-    'Medic': load_generated_character('medic-3d.png'),
-    'Defender': load_generated_character('defender-3d.png'),
-    'Scout': load_generated_character('scout-3d.png'),
-    'Student': load_generated_character('student-3d.png', 54),
-    'Zombie': load_generated_character('zombie-3d.png', 58),
-}
+# Painted semi-realistic characters, drawn in code (see sprites.py). Each role
+# has a standing frame and two walking steps, facing right and mirrored left.
+CHARACTER_SPRITES = build_character_sprites()
+ACTOR_IMAGES = {role: frames['right'][0] for role, frames in CHARACTER_SPRITES.items()}
+FACING_LEFT = {}  # which way each character last walked, so it faces that way
+
+
+def character_frame(a):
+    """The sprite frame for a character: facing its walking direction, stepping while it moves."""
+    if a.moving and abs(a.facing[0]) > .6:  # only clear sideways movement turns a character
+        FACING_LEFT[a.name] = a.facing[0] < 0
+    frames = CHARACTER_SPRITES[a.role]['left' if FACING_LEFT.get(a.name) else 'right']
+    return frames[1 + int(game.elapsed * 6) % 2] if a.moving else frames[0]
 
 
 def text(value, x, y, size=16, color=INK):
@@ -302,40 +297,61 @@ def draw_ambient_lights():
     screen.blit(lights, (OX, OY))
 
 
+# One colour per role, used for the ground ring, the name and the team list.
+ROLE_COLORS = {'Leader': (76, 162, 221), 'Rescuer': (240, 150, 60), 'Medic': (108, 224, 193),
+               'Defender': (178, 132, 255), 'Scout': (246, 222, 90), 'Student': (238, 238, 228),
+               'Zombie': (236, 72, 72)}
+
+
 def actor_label(a):
     """Role name, numbered for the two Defenders ('Defender 1', 'Defender 2')."""
     return a.name.replace('-', ' ') if a.role == 'Defender' else a.role
 
 
+def spot(a):
+    """Screen position of a character: exactly where it is in the simulation."""
+    return int(OX + a.x), int(OY + a.y)
+
+
+def show_all_names():
+    return debug or bool(pygame.key.get_mods() & pygame.KMOD_ALT)
+
+
 def draw_actor(a):
-    x, y = int(OX+a.x), int(OY+a.y)
-    if a is game.controlled_actor() and a.alive:
-        pygame.draw.circle(screen, (244, 195, 109), (x, y+5), 24, 2)
-        text('YOU', x-12, y-39, 12, (244, 195, 109))
+    x, y = spot(a)
     if not a.alive:
+        if a.role == 'Zombie':
+            # A neutralized zombie sinks away instead of littering the map.
+            fade = game.corpse_fade(a)
+            if fade > 0:
+                body = pygame.transform.smoothscale(ACTOR_IMAGES[a.role], (32, 22))
+                body.set_alpha(int(125 * fade))
+                screen.blit(body, body.get_rect(center=(x, y+5)))
+            return
         body = pygame.transform.smoothscale(ACTOR_IMAGES[a.role], (32, 22))
         body.set_alpha(125)
         screen.blit(body, body.get_rect(center=(x, y+5)))
         pygame.draw.line(screen, (229, 87, 82), (x-16, y-9), (x+16, y+12), 2)
         text('DOWN', x-18, y+12, 12, (233, 134, 131))
         return
-    colors = {'Leader': (76, 162, 221), 'Rescuer': (232, 168, 75),
-              'Medic': (108, 224, 193), 'Defender': (239, 119, 94),
-              'Scout': (244, 208, 104),
-              'Student': (174, 140, 224), 'Zombie': (138, 171, 90)}
-    color = colors[a.role]
-    pygame.draw.ellipse(screen, (23, 37, 34), (x-13, y+4, 26, 13))
+    color = ROLE_COLORS[a.role]
+    # A coloured ring on the ground tells roles apart at a glance.
+    pygame.draw.ellipse(screen, (23, 37, 34), (x-15, y+3, 30, 15))
+    pygame.draw.ellipse(screen, color, (x-15, y+3, 30, 15), 3)
+    if a is game.controlled_actor():
+        pygame.draw.circle(screen, (244, 195, 109), (x, y+5), 24, 2)
+        text('YOU', x-12, y-39, 12, (244, 195, 109))
     if a.moving:
         # Small dust puffs communicate movement without changing the stable
         # sprite orientation used by the Scout.
         pygame.draw.circle(screen, (119, 130, 112), (x-10, y+10), 2)
         pygame.draw.circle(screen, (119, 130, 112), (x+9, y+11), 2)
-    if a.role == 'Rescuer' and selected:
+    if a.role == 'Rescuer' and selected and player_role == 'Commander':
         pygame.draw.circle(screen, (245, 201, 120), (x, y), 21, 2)
     # The rendered characters are upright 3D cutouts.  The former Kenney sprites
     # were top-down and needed directional rotation; applying that rule here made
     # people appear to lie down whenever they moved sideways.
-    body = ACTOR_IMAGES[a.role]
+    body = character_frame(a)
     if a.flash:
         body = body.copy()
         body.fill((105, 105, 105, 0), special_flags=pygame.BLEND_RGB_ADD)
@@ -343,12 +359,15 @@ def draw_actor(a):
     # so it never looks like it is vibrating while waiting for new information.
     bob = int(math.sin(game.elapsed * 14) * 2) if a.moving and a.role != 'Scout' else 0
     screen.blit(body, body.get_rect(midbottom=(x, y + 16 + bob)))
-    if a.role == 'Rescuer':
-        pygame.draw.circle(screen, (252, 233, 187), (x, y + bob), 3)
-    rect((22, 32, 34), (x-17, y-28, 34, 4), 2)
-    rect((224, 104, 100) if a.hp < 40 else GREEN, (x-17, y-28, int(34*a.hp/100), 4), 2)
-    label = actor_label(a)
-    text(label, x - fonts[12].size(label)[0]//2, y+21, 12, color)
+    # Health bars appear only once a character has been hurt.
+    top = game.max_hp(a)
+    if a.hp < top:
+        rect((22, 32, 34), (x-17, y-28, 34, 4), 2)
+        rect((224, 104, 100) if a.hp < .4 * top else GREEN, (x-17, y-28, int(34*a.hp/top), 4), 2)
+    # Names: always yours and anybody in trouble; everybody while Alt is held.
+    if game.named_on_map(a) or show_all_names():
+        label = actor_label(a)
+        text(label, x - fonts[12].size(label)[0]//2, y+21, 12, color)
     if a.role == 'Student' and a.state == 'Waiting':
         radius = 9 + int((math.sin(game.elapsed * 5) + 1) * 2)
         pygame.draw.circle(screen, (241, 99, 95), (x, y-42), radius, 2)
@@ -406,7 +425,7 @@ def draw_threat_markers():
         target = actors_by_name.get(zombie.target_name)
         if not zombie.alive or not target or not target.alive or target.state == 'Rescued':
             continue
-        x, y = int(OX + target.x), int(OY + target.y)
+        x, y = spot(target)
         # A compact warning reticle reads as a combat cue without hiding the sprite.
         pygame.draw.circle(screen, (238, 93, 88), (x, y), pulse, 2)
         pygame.draw.line(screen, (238, 93, 88), (x-11, y-30), (x+11, y-30), 2)
@@ -421,28 +440,28 @@ def draw_action_effects():
     for defender in game.defenders:
         target = game.defender_targets.get(defender.name)
         if defender.state == 'Engage' and defender.cooldown > .35 and target and target.alive:
-            start = (int(OX + defender.x), int(OY + defender.y - 6))
-            end = (int(OX + target.x), int(OY + target.y))
+            start = spot(defender); start = (start[0], start[1] - 6)
+            end = spot(target)
             pygame.draw.line(screen, (248, 211, 112), start, end, 2)
             pygame.draw.circle(screen, (255, 235, 168), start, 5 + pulse)
     # Healing is visible as a calm medical ring around the current patient.
     if game.medic.task.startswith('Heal '):
         patient = actors.get(game.medic.task.removeprefix('Heal '))
         if patient and patient.alive and math.dist(game.medic.pos, patient.pos) < 45:
-            x, y = int(OX + patient.x), int(OY + patient.y)
+            x, y = spot(patient)
             pygame.draw.circle(screen, (103, 235, 194), (x, y), 24 + pulse, 2)
             text('+', x-4, y-44, 18, (151, 248, 214))
     # An escort tether explains who is being extracted without adding a panel.
     if game.escort_student and game.escort_student.alive:
         student, rescuer = game.escort_student, game.rescuer
-        start, end = (int(OX + rescuer.x), int(OY + rescuer.y)), (int(OX + student.x), int(OY + student.y))
+        start, end = spot(rescuer), spot(student)
         pygame.draw.line(screen, (244, 197, 112), start, end, 1)
         pygame.draw.circle(screen, (244, 197, 112), end, 23 + pulse, 2)
     # Bite arcs show that a zombie is actively dealing damage, not merely close.
     for zombie in game.zombies:
         target = actors.get(zombie.target_name)
         if zombie.alive and zombie.state == 'Attack' and target and target.alive:
-            x, y = int(OX + target.x), int(OY + target.y)
+            x, y = spot(target)
             pygame.draw.arc(screen, (240, 89, 84), (x-28, y-28, 56, 56), .3, 2.8, 3)
     # A pickup leaves a quick collection pulse after it disappears.
     for pickup in game.pickups:
@@ -468,7 +487,9 @@ def draw_world():
     visible_actors = [a for a in game.actors if a.role not in ('Student', 'Zombie') or game.discovered[a.name]]
     draw_threat_markers()
     draw_action_effects()
-    for actor in sorted(visible_actors, key=lambda actor: actor.y):
+    # Back to front, with your own character always drawn last so it is never hidden.
+    player = game.controlled_actor()
+    for actor in sorted(visible_actors, key=lambda actor: (actor is player, actor.y)):
         draw_actor(actor)
 
 
@@ -536,6 +557,7 @@ def draw():
     for i, a in enumerate((game.leader, game.rescuer, game.medic, *game.defenders, game.scout, game.student)):
         y = 207+i*17
         text(actor_label(a), 946, y, 13)
+        pygame.draw.circle(screen, ROLE_COLORS[a.role], (1030, y+9), 4)
         rect((46, 60, 63), (1040, y+5, 100, 8), 4)
         rect(GREEN if a.hp > 35 else (237, 119, 110), (1040, y+5, int(a.hp), 8), 4)
     intel = 'STUDENT LOCATED' if game.discovered['Student'] else 'SCOUT SEARCHING FOR STUDENT'
@@ -576,8 +598,8 @@ def draw():
             current += word+' '
         text(current, 946, y, 12, MUTED)
         y += 26
-    controls = ('WASD Move  |  Shift Run  |  Space Strike  |  E Rescue/Command  |  F4 Full Map  |  P Pause  |  R Restart'
-                if player_role == 'Commander' else 'WASD Move  |  Shift Run  |  E Context Action  |  F4 Full Map  |  P Pause  |  R Restart')
+    controls = ('WASD Move  |  Shift Run  |  Space Strike  |  E Rescue/Command  |  Alt Names  |  F4 Full Map  |  F11 Window  |  P Pause  |  R Restart'
+                if player_role == 'Commander' else 'WASD Move  |  Shift Run  |  E Context Action  |  Alt Names  |  F4 Full Map  |  F11 Window  |  P Pause  |  R Restart')
     text(controls, 22, 742, 12, MUTED)
     if game.shove_cooldown > .4:
         pygame.draw.circle(screen, (221, 233, 202), (int(OX+game.leader.x), int(OY+game.leader.y)), 38, 2)
@@ -638,6 +660,8 @@ def draw_menu():
         text('Choose Commander or a field role before each mission.', 319, 332, 16, MUTED)
         text('WASD moves your role. E performs its context action.', 319, 364, 16, MUTED)
         text('Resources help the team, but every Safe Zone tile releases an escort.', 319, 396, 16, MUTED)
+        text('F11 switches between fullscreen and a window.', 319, 428, 16, MUTED)
+        text('Hold Alt to show every name. Ring colours mark each role; zombies are red.', 319, 460, 16, MUTED)
         menu_button('back', 'BACK TO MENU  [ESC]', (319, 515, 330, 48), True)
 
 
@@ -648,7 +672,10 @@ while running:
         if event.type == pygame.QUIT:
             running = False
         elif event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_ESCAPE:
+            if event.key == pygame.K_F11:
+                if not HEADLESS:
+                    pygame.display.toggle_fullscreen()
+            elif event.key == pygame.K_ESCAPE:
                 if screen_state == 'game':
                     running = False
                 else:
