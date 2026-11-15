@@ -1,6 +1,8 @@
 import unittest
+import pygame
 from adaptive import train
-from world import Game, WALLS, SAFE, center, cell, pathfind
+from fog import ALL_CELLS, BUILDING_FOOTPRINTS, CloudFog, FogField, visual_clear_cells
+from world import Game, WALLS, SAFE, ROWS, COLS, TILE, center, cell, pathfind, walkable
 
 class MissionTests(unittest.TestCase):
     def test_ml_model_trains_after_fifteen_completed_missions(self):
@@ -268,5 +270,63 @@ class MissionTests(unittest.TestCase):
         self.assertEqual(game.leader.task, 'Coordinate Team')
         self.assertEqual(game.medic.task, 'Stage at Clinic')
         self.assertEqual(game.defender.task, 'Guard Safe Zone')
+
+    def test_scout_sweeps_the_whole_campus_and_reports_back(self):
+        game = Game(seed=4)
+        game.command('Hold')  # keep the mission running while the Scout searches
+        for zombie in game.zombies:
+            zombie.hp = 0
+        for _ in range(60 * 120):
+            game.update(1 / 60)
+            if game.scout.task == 'Report to Commander':
+                break
+        self.assertEqual(game.scout.task, 'Report to Commander')
+        unsearched = [c for c in ALL_CELLS if walkable(c) and c not in game.revealed]
+        self.assertEqual(unsearched, [])
+        self.assertEqual([c for c in ALL_CELLS if c not in visual_clear_cells(game.revealed)], [])
+
+
+class FogTests(unittest.TestCase):
+    def test_only_scouted_ground_is_clear(self):
+        revealed = {(10, 5), (11, 5)}
+        clear = visual_clear_cells(revealed)
+        self.assertTrue(revealed <= clear)
+        self.assertNotIn((20, 12), clear)
+
+    def test_building_roof_clears_once_every_route_around_it_is_scouted(self):
+        cells, around = BUILDING_FOOTPRINTS[0]
+        self.assertFalse(cells & visual_clear_cells(set(around) - {next(iter(around))}))
+        self.assertTrue(cells <= visual_clear_cells(set(around)))
+
+    def test_fog_rolls_back_smoothly_instead_of_popping(self):
+        revealed = set()
+        field = FogField()
+        field.update(revealed, 0)
+        revealed.add((14, 9))
+        field.update(revealed, .1)
+        self.assertGreater(field.density[(14, 9)], 0)
+        self.assertLess(field.density[(14, 9)], 1)
+        for _ in range(40):
+            field.update(revealed, .1)
+        self.assertEqual(field.density[(14, 9)], 0)
+        self.assertEqual(field.density[(20, 12)], 1)
+
+    def test_new_mission_starts_with_fresh_fog(self):
+        field = FogField()
+        field.update({(14, 9)}, 0)
+        field.update({(3, 3)}, .1)  # a new mission has a new revealed set
+        self.assertEqual(field.density[(14, 9)], 1)
+        self.assertEqual(field.density[(3, 3)], 0)
+
+    def test_fog_hides_unscouted_campus_and_leaves_scouted_ground_clear(self):
+        fog = CloudFog()
+        revealed = {(x, y) for x in range(2, 9) for y in range(15, 20)}
+        surface = pygame.Surface((COLS * TILE, ROWS * TILE))
+        surface.fill((0, 0, 0))
+        fog.draw(surface, (0, 0), revealed, 0.0)
+        clear_pixel = surface.get_at((int(center((5, 17))[0]), int(center((5, 17))[1])))
+        fog_pixel = surface.get_at((int(center((20, 5))[0]), int(center((20, 5))[1])))
+        self.assertLess(max(clear_pixel[:3]), 10)
+        self.assertGreater(min(fog_pixel[:3]), 90)
 
 if __name__ == '__main__': unittest.main()

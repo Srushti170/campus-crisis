@@ -105,7 +105,13 @@ class Game:
         # Cover every outdoor part of the campus. The former short list could
         # clear its own patrol stops while leaving a survivor hidden elsewhere.
         grid_scout_points=[(x,y) for y in range(2,ROWS-1,4) for x in range(2,COLS-1,4) if walkable((x,y))]
-        self.time=float(self.mission['time']); self.elapsed=0.; self.result=None; self.order='Follow' if player_role=='Commander' else 'Rescue'; self.escort_student=None; self.defender_target=None; self.medkits=max(1,3-sector_pressure); self.ammo=20; self.fuel=0; self.fuel_required=self.mission['fuel']; self.shove_cooldown=0; self.routes={}; self.scout_points=list(dict.fromkeys(base_scout_points+grid_scout_points)); self.scout_point=0; self.revealed=set()
+        # Add a sector for any outdoor tile no planned sector reaches, so a full
+        # sweep clears every route (the west road between Science and Hostel
+        # was previously never searched and kept its fog forever).
+        scout_points=list(dict.fromkeys(base_scout_points+grid_scout_points))
+        for tile in ((x,y) for y in range(ROWS) for x in range(COLS) if walkable((x,y))):
+            if all(math.dist(tile,point)>3.6 for point in scout_points): scout_points.append(tile)
+        self.time=float(self.mission['time']); self.elapsed=0.; self.result=None; self.order='Follow' if player_role=='Commander' else 'Rescue'; self.escort_student=None; self.defender_target=None; self.medkits=max(1,3-sector_pressure); self.ammo=20; self.fuel=0; self.fuel_required=self.mission['fuel']; self.shove_cooldown=0; self.routes={}; self.scout_points=scout_points; self.scout_point=0; self.revealed=set()
         for zombie in self.zombies: zombie.hp += sector_pressure*12
         self.discovered={'Student':False,'Zombie':False,**{a.name:False for a in (*self.students,*self.zombies)}}; self.reveal(self.leader.pos,2.5); self.reveal(self.scout.pos,3); self.logs=[self.mission['title']+': '+self.mission['objective'],'Scout: searching unexplored campus sectors.','Queue the rescue order with E.']
         self.stats={'students_rescued':0,'zombies_neutralized':0,'medkits_used':0,'damage_taken':0,'task_changes':0}
@@ -228,7 +234,11 @@ class Game:
             current=self.scout_points[self.scout_point]
             # Once a sector is clear, choose the remaining fog with the largest
             # reveal value. This stops the Scout patrolling already-known ground.
-            if self.scout_unseen_coverage(current)<=6 or math.dist(a.pos,center(current))<9:
+            # Only switch when the sector is fully clear or reached: switching at
+            # a "small remainder" threshold made the Scout flip between two
+            # nearly-clear sectors every frame and stand still for the rest of
+            # the mission.
+            if self.scout_unseen_coverage(current)==0 or math.dist(a.pos,center(current))<9:
                 self.scout_point=self.choose_scout_sector(a.pos,exclude=self.scout_point)
             dest=center(self.scout_points[self.scout_point]); self.assign(a,f'Explore Sector {self.scout_point+1}',self.task_score(55,55,math.dist(a.pos,dest)),f'exploring sector {self.scout_point+1}'); self.navigate(a,dest,108,dt,7)
         self.scout_observe(a,3.6); self.reveal(self.leader.pos,2.2)

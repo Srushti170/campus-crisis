@@ -14,7 +14,8 @@ if args.smoke_test or args.screenshot:
     os.environ['SDL_VIDEODRIVER'] = 'dummy'
     os.environ['SDL_AUDIODRIVER'] = 'dummy'
 import pygame
-from world import Game, TILE, COLS, ROWS, BUILDINGS, SAFE, LANDMARKS, center, walkable
+from world import Game, TILE, COLS, ROWS, BUILDINGS, SAFE, LANDMARKS, center
+from fog import CloudFog
 from adaptive import recommend, report
 from campaign import load_progress, record_completion, reset_progress
 
@@ -148,17 +149,23 @@ def menu_button(key, label, bounds, accent=False):
     screen.blit(rendered, rendered.get_rect(center=menu_buttons[key].center))
 
 
+def draw_map_labels():
+    """Building name tags, drawn above the fog so the campus stays readable."""
+    if not REALISTIC_CAMPUS:
+        return
+    for label, tile, width in (('ADMIN BLOCK',(2,2),116),('LIBRARY',(15,2),92),('PARKING',(22,2),88),
+                               ('SECURITY',(24,6),88),('SCIENCE LAB',(2,8),104),('LECTURE HALL',(16,8),112),
+                               ('HOSTEL',(2,14),82),('CAFETERIA',(13,14),96),('SPORTS COURT',(22,14),110)):
+        x, y = OX+tile[0]*TILE, OY+tile[1]*TILE
+        tag = pygame.Surface((width, 24), pygame.SRCALPHA)
+        tag.fill((12, 25, 31, 210))
+        screen.blit(tag, (x, y))
+        text(label, x+8, y+5, 12, (229, 239, 234))
+
+
 def draw_map():
     if REALISTIC_CAMPUS:
         screen.blit(REALISTIC_CAMPUS, (OX, OY))
-        for label, tile, width in (('ADMIN BLOCK',(2,2),116),('LIBRARY',(15,2),92),('PARKING',(22,2),88),
-                                   ('SECURITY',(24,6),88),('SCIENCE LAB',(2,8),104),('LECTURE HALL',(16,8),112),
-                                   ('HOSTEL',(2,14),82),('CAFETERIA',(13,14),96),('SPORTS COURT',(22,14),110)):
-            x, y = OX+tile[0]*TILE, OY+tile[1]*TILE
-            tag = pygame.Surface((width, 24), pygame.SRCALPHA)
-            tag.fill((12, 25, 31, 210))
-            screen.blit(tag, (x, y))
-            text(label, x+8, y+5, 12, (229, 239, 234))
         # The generated environment is decorative; this overlay keeps the
         # playable extraction point unambiguous above the realistic art.
         sx, sy, sw, sh = SAFE
@@ -348,15 +355,16 @@ buttons = [(pygame.Rect(944, 370+i*43, 232, 35), order, label)
            for i, (order, label) in enumerate([('Rescue', '[E]  Rescue student'), ('Follow', '[F]  Follow Commander'), ('Hold', '[H]  Hold position')])]
 
 
+CAMPUS_FOG = CloudFog()
+
+
 def draw_fog():
-    fog = pygame.Surface((TILE, TILE), pygame.SRCALPHA)
-    fog.fill((5, 13, 20, 125 if REALISTIC_CAMPUS else 188))
-    for y in range(ROWS):
-        for x in range(COLS):
-            # The fenced perimeter and building interiors are not searchable
-            # terrain, so they should never look like unexplored campus fog.
-            if walkable((x, y)) and (x, y) not in game.revealed:
-                screen.blit(fog, (OX + x*TILE, OY + y*TILE))
+    """Drifting cloud fog over every part of campus the team has not scouted.
+
+    Real time drives the drift, so the fog keeps moving while the game is
+    paused; cleared areas roll back smoothly as the Scout reveals them.
+    """
+    CAMPUS_FOG.draw(screen, (OX, OY), game.revealed, pygame.time.get_ticks() / 1000)
 
 
 def draw_pickup(pickup):
@@ -447,6 +455,7 @@ def draw_world():
                 pygame.draw.lines(screen, (220, 121, 101) if role == 'Zombie' else (103, 211, 224), False, points, 2)
     draw_ambient_lights()
     draw_fog()
+    draw_map_labels()
     for pickup in game.pickups:
         draw_pickup(pickup)
     visible_actors = [a for a in game.actors if a.role not in ('Student', 'Zombie') or game.discovered[a.name]]
