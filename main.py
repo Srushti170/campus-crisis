@@ -11,6 +11,7 @@ parser.add_argument('--smoke-test', action='store_true', help='Render 120 frames
 parser.add_argument('--screenshot', type=str, help='Save a frame and exit')
 parser.add_argument('--preview-game', action='store_true', help='Open directly into a mission for visual review')
 parser.add_argument('--state', type=str, help='Start on a given menu screen (menu/briefing/role_select/howto) for visual review')
+parser.add_argument('--panel-tab', type=str, help='Open the Mission Control panel on a given tab (status/tactics/log)')
 args = parser.parse_args()
 HEADLESS = bool(args.smoke_test or args.screenshot)
 if HEADLESS:
@@ -50,6 +51,13 @@ screen_state, difficulty = 'menu', 'Normal'
 adaptive_plan = recommend()
 adaptive_data = report()
 menu_buttons = {}
+active_panel_tab = 'status'   # Mission Control tabs: status / tactics / log
+PANEL_TABS = {}               # clickable tab-strip rects, re-registered each frame
+TOASTS = []                   # map toasts: newest first, max 3 visible
+CRITICAL_ACTORS = set()       # teammates whose critical toast is alive
+LAST_TARGETS = {}             # zombie name -> last lock-on target (transition trigger)
+STUDENT_LOCATED_SEEN = False
+SEEN_PICKUPS = set()
 last_log_message = ''
 audio_muted = False
 campaign_notice = ''
@@ -59,6 +67,8 @@ if args.preview_game:
     screen_state = 'game'
 if args.state:
     screen_state = args.state
+if args.panel_tab:
+    active_panel_tab = args.panel_tab
 ASSET_ROOT = Path(__file__).parent / 'assets' / 'kenney-top-down-shooter'
 REALISTIC_MAP_PATH = Path(__file__).parent / 'assets' / 'generated' / 'campus-game-map-v4.png'
 
@@ -88,6 +98,13 @@ def play_sound(name):
         SOUNDS[name].play()
 
 
+def clear_mission_trackers():
+    """Toast/transition trackers are per-mission state."""
+    global TOASTS, CRITICAL_ACTORS, LAST_TARGETS, STUDENT_LOCATED_SEEN, SEEN_PICKUPS
+    TOASTS, CRITICAL_ACTORS, LAST_TARGETS = [], set(), {}
+    STUDENT_LOCATED_SEEN, SEEN_PICKUPS = False, set()
+
+
 def start_campaign_mission():
     """Create the currently unlocked sector and apply optional difficulty aid."""
     global game, paused, mission_outcome_processed, campaign_notice, last_log_message
@@ -100,6 +117,7 @@ def start_campaign_mission():
     game.log(f"Sector {game.campaign_level}: adaptive setting {adaptive_plan['label']}.")
     last_log_message = game.logs[-1]
     paused, mission_outcome_processed, campaign_notice = False, False, ''
+    clear_mission_trackers()
 
 
 def reset_campaign():
@@ -108,6 +126,7 @@ def reset_campaign():
     campaign = reset_progress()
     game = Game(campaign_level=1, player_role=player_role)
     campaign_notice, mission_outcome_processed = 'Campaign reset. Sector 1 is ready.', False
+    clear_mission_trackers()
 
 
 GRASS = load_asset('PNG/Tiles/tile_01.png', (TILE, TILE))
@@ -232,6 +251,86 @@ def draw_warning_icon(cx, cy, color=DANGER_TEXT):
 
 def draw_divider(y, x=946, width=228):
     rect(PANEL_EDGE, (x, y, width, 1))
+
+
+# ---------------------------------------------------------------------------
+# Map toasts: urgent events appear just under the map's top edge, so the panel
+# never has to carry transient alarms. Max 3 visible, newest on top.
+# ---------------------------------------------------------------------------
+def spawn_toast(message, color, persist=False, key=None, sound='radio'):
+    global TOASTS
+    TOASTS.insert(0, {'text': message, 'color': color, 'born': pygame.time.get_ticks(),
+                      'persist': persist, 'key': key})
+    while len(TOASTS) > 3:  # evict the oldest transient; never evict a persistent alert
+        for i, toast in enumerate(TOASTS):
+            if not toast['persist']:
+                TOASTS.pop(i)
+                break
+        else:
+            TOASTS.pop()
+    play_sound(sound)
+
+
+def drop_toast(key):
+    global TOASTS
+    TOASTS = [toast for toast in TOASTS if toast['key'] != key]
+
+
+def update_toasts():
+    """Spawn toasts on state transitions; retire persistent ones when resolved."""
+    global STUDENT_LOCATED_SEEN
+    team = (game.leader, game.rescuer, game.medic, *game.defenders, game.scout, game.student)
+    for a in team:
+        critical = a.alive and a.hp < .35 * game.max_hp(a)
+        if critical and a.name not in CRITICAL_ACTORS:
+            CRITICAL_ACTORS.add(a.name)
+            spawn_toast(f'{actor_label(a).upper()} IS CRITICAL', DANGER_TEXT, True, ('critical', a.name), 'hit')
+        elif not critical and a.name in CRITICAL_ACTORS:
+            CRITICAL_ACTORS.discard(a.name)
+            drop_toast(('critical', a.name))
+    actors_by_name = {a.name: a for a in game.actors}
+    for z in game.zombies:
+        key = ('lockon', z.name)
+        target = actors_by_name.get(z.target_name)
+        valid = z.alive and target and target.alive and target.state != 'Rescued'
+        if valid and LAST_TARGETS.get(z.name) != z.target_name:
+            spawn_toast(f'{z.name} → {z.target_name}', DANGER_TEXT, True, key, 'hit')
+        elif not valid:
+            drop_toast(key)
+        LAST_TARGETS[z.name] = z.target_name
+    if game.discovered['Student'] and not STUDENT_LOCATED_SEEN:
+        STUDENT_LOCATED_SEEN = True
+        spawn_toast('STUDENT LOCATED', GREEN, False, ('located',), 'radio')
+    for i, pickup in enumerate(game.pickups):
+        if pickup.collected and i not in SEEN_PICKUPS:
+            SEEN_PICKUPS.add(i)
+            label = {'medkit': 'MEDKIT COLLECTED', 'ammo': 'AMMO COLLECTED', 'fuel': 'FUEL COLLECTED'}[pickup.kind]
+            color = {'medkit': (218, 80, 77), 'ammo': (234, 180, 69), 'fuel': (70, 160, 215)}[pickup.kind]
+            spawn_toast(label, color, False, ('pickup', i), 'pickup')
+
+
+def draw_toasts():
+    """Toast strip pinned under the map's top edge; transients fade, persistent wait."""
+    now = pygame.time.get_ticks()
+    for i, toast in enumerate(list(TOASTS)):
+        if i >= 3:
+            break
+        age = (now - toast['born']) / 1000
+        if not toast['persist'] and age > 4:
+            TOASTS.remove(toast)
+            continue
+        alpha = 215
+        if not toast['persist'] and age > 3.4:
+            alpha = max(0, int(215 * (4 - age) / .6))
+        if alpha <= 0:
+            continue
+        box = pygame.Surface((240, 24), pygame.SRCALPHA)
+        pygame.draw.rect(box, (12, 25, 31, alpha), (0, 0, 240, 24), border_radius=6)
+        pygame.draw.rect(box, (*toast['color'], alpha), (0, 0, 4, 24), border_radius=2)
+        rendered = fonts[12].render(toast['text'], True, toast['color'])
+        rendered.set_alpha(alpha)
+        box.blit(rendered, (12, 6))
+        screen.blit(box, (OX + 12, OY + 8 + i * 28))
 
 
 # ---------------------------------------------------------------------------
@@ -617,9 +716,9 @@ def draw_actor(a):
         text(a.state, x-23, y+36, 12)
 
 
-buttons = [(pygame.Rect(946, 468, 228, 26), 'Rescue', '[E] RESCUE'),
-           (pygame.Rect(946, 500, 111, 26), 'Follow', '[F] FOLLOW'),
-           (pygame.Rect(1063, 500, 111, 26), 'Hold', '[H] HOLD')]
+buttons = [(pygame.Rect(946, 320, 228, 26), 'Rescue', '[E] RESCUE'),
+           (pygame.Rect(946, 352, 111, 26), 'Follow', '[F] FOLLOW'),
+           (pygame.Rect(1063, 352, 111, 26), 'Hold', '[H] HOLD')]
 
 
 CAMPUS_FOG = CloudFog()
@@ -789,92 +888,118 @@ def draw():
     rect((76, 101, 107) if audio_muted else (51, 92, 81), mute_button, 6)
     text('MUTED [M]' if audio_muted else 'SOUND ON [M]', 1061, 53, 12, INK)
     draw_world()
-    # ---- Mission Control side panel: sectioned, divided, icon-anchored ----
+    update_toasts()
+    # ---- Mission Control side panel: pinned header + threat, tabbed body ----
     rect(PANEL, (932, 94, 256, 640), 8)
     rect(PANEL_EDGE, (932, 94, 256, 640), 8, 1)
-    rect((29, 54, 58), (932, 94, 256, 44), 8)
-    pygame.draw.circle(screen, GREEN if not game.result else AMBER, (950, 116), 4)
-    text('MISSION CONTROL', 962, 106, 18, (220, 235, 230))
-    draw_divider(139)
-    text(f"SECTOR {game.campaign_level} / 3", 946, 148, 12, AMBER)
-    clip_text(game.mission['title'].upper(), 946, 164, 14, GREEN, 228)
-    clip_text(game.mission['objective'], 946, 182, 12, MUTED, 228)
-    draw_icon_person(950, 208)
-    text(str(len(game.students)), 960, 202, 12)
-    draw_icon_skull(994, 208)
-    text(str(len(game.zombies)), 1004, 202, 12)
-    draw_icon_clock(1040, 208)
-    text(f'{int(game.time)}s', 1050, 202, 12, AMBER)
+    rect((29, 54, 58), (932, 94, 256, 40), 8)
+    pygame.draw.circle(screen, GREEN if not game.result else AMBER, (950, 114), 4)
+    text('MISSION CONTROL', 962, 104, 18, (220, 235, 230))
+    draw_divider(135)
+    # Pinned: mission identity and the fight's core numbers.
+    text(f"SECTOR {game.campaign_level} / 3", 946, 144, 12, AMBER)
+    clip_text(game.mission['title'].upper(), 946, 160, 14, GREEN, 228)
+    draw_icon_person(950, 188)
+    text(str(len(game.students)), 960, 182, 12)
+    draw_icon_skull(994, 188)
+    text(str(len(game.zombies)), 1004, 182, 12)
+    draw_icon_clock(1040, 188)
+    text(f'{int(game.time)}s', 1050, 182, 12, AMBER)
     intel = 'STUDENT LOCATED' if game.discovered['Student'] else 'SCOUT SEARCHING FOR STUDENT'
-    clip_text(intel, 946, 222, 12, GREEN if game.discovered['Student'] else AMBER_TEXT, 228)
-    draw_divider(238)
-    text('TEAM STATUS', 946, 246, 12, MUTED)
-    for i, a in enumerate((game.leader, game.rescuer, game.medic, *game.defenders, game.scout, game.student)):
-        y = 262 + i * 20
-        top = game.max_hp(a)
-        low = a.hp < .35 * top
-        pygame.draw.circle(screen, ROLE_COLORS[a.role], (952, y + 9), 4)
-        clip_text(actor_label(a), 962, y + 2, 12, INK, 66)
-        rect((46, 60, 63), (1036, y + 4, 120, 10), 5)
-        rect(DANGER if low else GREEN, (1036, y + 4, max(6, int(120 * a.hp / top)), 10), 5)
-        if low:  # a breathing outline makes critical teammates unmissable
-            glow = pygame.Surface((126, 16), pygame.SRCALPHA)
-            pygame.draw.rect(glow, (*DANGER, int(70 + 60 * math.sin(t * 6))), (0, 0, 126, 16), width=2, border_radius=8)
-            screen.blit(glow, (1033, y + 1))
-    draw_divider(404)
+    clip_text(intel, 946, 202, 12, GREEN if game.discovered['Student'] else AMBER_TEXT, 228)
+    draw_divider(218)
+    # Pinned: ongoing pursuit state (toasts announce the event; this is the state).
     active_targets = [f'{z.name} → {z.target_name}' for z in game.zombies if z.target_name]
     if active_targets:
-        rect((60, 25, 25), (940, 408, 240, 30), 4)
-        draw_warning_icon(954, 423)
-        text('THREAT', 968, 412, 12, DANGER_TEXT)
-        clip_text(', '.join(active_targets), 946, 426, 12, DANGER_TEXT, 224)
+        rect((60, 25, 25), (940, 224, 240, 30), 4)
+        draw_warning_icon(954, 239)
+        text('THREAT', 968, 228, 12, DANGER_TEXT)
+        clip_text(', '.join(active_targets), 946, 242, 12, DANGER_TEXT, 224)
     else:
-        draw_warning_icon(954, 423, (120, 140, 142))
-        text('THREAT', 968, 412, 12, MUTED)
-        text('No active pursuit', 946, 426, 12, MUTED)
-    draw_divider(444)
-    text('YOUR CONTROLS: '+player_role.upper() if player_role != 'Commander' else 'COMMAND PANEL', 946, 452, 12, AMBER)
-    if player_role == 'Commander':
-        for bounds, order, label in buttons:
-            active = game.order == order
-            rect((54, 100, 90) if active else (31, 46, 55), bounds, 5)
-            rect(GREEN if active else (52, 75, 80), bounds, 5, 1)
-            text(label, bounds.x + 9, bounds.y + 6, 12, INK if active else MUTED)
+        draw_warning_icon(954, 239, (120, 140, 142))
+        text('THREAT', 968, 228, 12, MUTED)
+        text('No active pursuit', 946, 242, 12, MUTED)
+    draw_divider(260)
+    # Tab strip: STATUS | TACTICS | LOG.
+    tab_labels = (('status', 'STATUS'), ('tactics', 'TACTICS'), ('log', 'LOG'))
+    for index, (tab_key, tab_label) in enumerate(tab_labels):
+        tab_bounds = pygame.Rect(940 + index * 79, 266, 76, 26)
+        PANEL_TABS[tab_key] = tab_bounds
+        current = active_panel_tab == tab_key
+        rect((55, 105, 92) if current else (30, 48, 56), tab_bounds, 5)
+        rect(GREEN if current else (52, 75, 80), tab_bounds, 5, 1)
+        rendered = fonts[12].render(tab_label, True, INK if current else MUTED)
+        screen.blit(rendered, rendered.get_rect(center=tab_bounds.center))
+    draw_divider(298)
+    if active_panel_tab == 'status':
+        text('TEAM STATUS', 946, 308, 12, MUTED)
+        for i, a in enumerate((game.leader, game.rescuer, game.medic, *game.defenders, game.scout, game.student)):
+            y = 328 + i * 28
+            top = game.max_hp(a)
+            low = a.hp < .35 * top
+            pygame.draw.circle(screen, ROLE_COLORS[a.role], (952, y + 9), 4)
+            clip_text(actor_label(a), 962, y + 2, 12, INK, 66)
+            rect((46, 60, 63), (1036, y + 4, 120, 10), 5)
+            rect(DANGER if low else GREEN, (1036, y + 4, max(6, int(120 * a.hp / top)), 10), 5)
+            if low:  # a breathing outline makes critical teammates unmissable
+                glow = pygame.Surface((126, 16), pygame.SRCALPHA)
+                pygame.draw.rect(glow, (*DANGER, int(70 + 60 * math.sin(t * 6))), (0, 0, 126, 16), width=2, border_radius=8)
+                screen.blit(glow, (1033, y + 1))
+    elif active_panel_tab == 'tactics':
+        text('YOUR CONTROLS: '+player_role.upper() if player_role != 'Commander' else 'COMMAND PANEL', 946, 308, 12, AMBER)
+        if player_role == 'Commander':
+            for bounds, order, label in buttons:
+                active = game.order == order
+                rect((54, 100, 90) if active else (31, 46, 55), bounds, 5)
+                rect(GREEN if active else (52, 75, 80), bounds, 5, 1)
+                text(label, bounds.x + 9, bounds.y + 6, 12, INK if active else MUTED)
+        else:
+            action_help = {
+                'Rescuer': '[E] Start escort / collect nearby item',
+                'Medic': '[E] Treat nearby teammate / collect item',
+                'Defender': '[E] Engage zombie / collect ammo',
+                'Scout': '[E] Scan nearby sector / collect item',
+            }[player_role]
+            rect((24, 38, 46), (946, 320, 228, 58), 5)
+            rect((52, 75, 80), (946, 320, 228, 58), 5, 1)
+            text(action_help, 956, 330, 12, INK)
+            text('WASD move  |  Shift run', 956, 350, 12, MUTED)
+        draw_divider(394)
+        text('AI DECISIONS', 946, 404, 12, MUTED)
+        for i, a in enumerate((game.scout, game.medic, *game.defenders)):
+            y = 424 + i * 18
+            task = 'You are in control' if a is game.controlled_actor() else a.task
+            controlled = a is game.controlled_actor()
+            clip_text(f'{actor_label(a)}: {task}', 946, y, 12, AMBER if controlled else MUTED, 228)
+        draw_divider(500)
+        text('RESOURCES', 946, 510, 12, MUTED)
+        draw_icon_medkit(954, 532)
+        text('Medkits', 966, 526, 12)
+        text(str(game.medkits), 1174 - fonts[12].size(str(game.medkits))[0], 526, 12)
+        draw_icon_ammo(954, 558)
+        text('Ammo', 966, 552, 12)
+        text(str(game.ammo), 1174 - fonts[12].size(str(game.ammo))[0], 552, 12)
+        draw_icon_fuel(954, 584)
+        text('Fuel secured', 966, 578, 12)
+        fuel_text = f'{game.fuel}/{game.fuel_required}'
+        text(fuel_text, 1174 - fonts[12].size(fuel_text)[0], 578, 12, (70, 160, 215))
     else:
-        action_help = {
-            'Rescuer': '[E] Start escort / collect nearby item',
-            'Medic': '[E] Treat nearby teammate / collect item',
-            'Defender': '[E] Engage zombie / collect ammo',
-            'Scout': '[E] Scan nearby sector / collect item',
-        }[player_role]
-        rect((24, 38, 46), (946, 468, 228, 58), 5)
-        rect((52, 75, 80), (946, 468, 228, 58), 5, 1)
-        text(action_help, 956, 478, 12, INK)
-        text('WASD move  |  Shift run', 956, 498, 12, MUTED)
-    draw_divider(540)
-    draw_icon_medkit(954, 562)
-    text(str(game.medkits), 966, 556, 12)
-    draw_icon_ammo(1002, 562)
-    text(str(game.ammo), 1014, 556, 12)
-    draw_icon_fuel(1048, 562)
-    text(f'{game.fuel}/{game.fuel_required}', 1060, 556, 12, (70, 160, 215))
-    draw_divider(576)
-    text('AI DECISIONS', 946, 584, 12, MUTED)
-    for i, a in enumerate((game.scout, game.medic, *game.defenders)):
-        y = 600 + i * 15
-        task = 'You are in control' if a is game.controlled_actor() else f'{a.task}  [{a.task_score}]'
-        controlled = a is game.controlled_actor()
-        clip_text(f'{actor_label(a)}: {task}', 946, y, 12, AMBER if controlled else MUTED, 228)
-    draw_divider(664)
-    text('FIELD COMMS', 946, 672, 12, GREEN)
-    rect((74, 129, 117), (940, 688, 2, 42))
-    newest = wrap_line(game.logs[-1], 34)[:2]
-    for row, line in enumerate(newest):
-        text(('> ' if row == 0 else '  ')+line, 948, 690 + row * 15, 12, MUTED)
-    if len(game.logs) > 1 and len(newest) < 2:
-        clip_text(game.logs[-2], 948, 720, 12, (100, 116, 118), 222)
-    controls = ('WASD Move  |  Shift Run  |  Space Strike  |  E Rescue/Command  |  Alt Names  |  F4 Full Map  |  F11 Window  |  P Pause  |  R Restart'
-                if player_role == 'Commander' else 'WASD Move  |  Shift Run  |  E Context Action  |  Alt Names  |  F4 Full Map  |  F11 Window  |  P Pause  |  R Restart')
+        y, first_line = 310, True
+        rect((74, 129, 117), (940, 310, 2, min(30, len(wrap_line(game.logs[-1], 34)[:2]) * 15)))
+        for message in reversed(game.logs):
+            for line in wrap_line(message, 34)[:2]:
+                if y > 718:
+                    break
+                text(('› ' if first_line else '  ')+line, 948, y, 12,
+                     MUTED if first_line else (120, 140, 142))
+                first_line = False
+                y += 15
+            y += 8
+            if y > 718:
+                break
+    draw_toasts()
+    controls = ('WASD Move  |  Shift Run  |  Space Strike  |  E Rescue/Command  |  Alt Names  |  F4 Full Map  |  F5-F7 Panel  |  F11 Window  |  P Pause  |  R Restart'
+                if player_role == 'Commander' else 'WASD Move  |  Shift Run  |  E Context Action  |  Alt Names  |  F4 Full Map  |  F5-F7 Panel  |  F11 Window  |  P Pause  |  R Restart')
     text(controls, 22, 742, 12, MUTED)
     if game.shove_cooldown > .4:
         pygame.draw.circle(screen, (221, 233, 202), (int(OX+game.leader.x), int(OY+game.leader.y)), 38, 2)
@@ -1029,6 +1154,12 @@ while running:
                 debug = not debug
             elif event.key == pygame.K_F4:
                 full_map = not full_map
+            elif event.key == pygame.K_F5:
+                active_panel_tab = 'status'
+            elif event.key == pygame.K_F6:
+                active_panel_tab = 'tactics'
+            elif event.key == pygame.K_F7:
+                active_panel_tab = 'log'
             elif event.key == pygame.K_TAB:
                 selected = not selected
             elif not paused:
@@ -1057,10 +1188,14 @@ while running:
                 if mute_button.collidepoint(event.pos):
                     audio_muted = not audio_muted
                     continue
+                for tab_key, tab_bounds in PANEL_TABS.items():
+                    if tab_bounds.collidepoint(event.pos):
+                        active_panel_tab = tab_key
+                        break
                 if math.dist((mx-OX, my-OY), game.rescuer.pos) < 28:
                     selected = True
                 for bounds, order, _ in buttons:
-                    if player_role == 'Commander' and selected and bounds.collidepoint(event.pos):
+                    if player_role == 'Commander' and selected and active_panel_tab == 'tactics' and bounds.collidepoint(event.pos):
                         game.command(order)
     keys = pygame.key.get_pressed()
     if screen_state == 'game' and not paused:
