@@ -302,6 +302,11 @@ def draw_ambient_lights():
     screen.blit(lights, (OX, OY))
 
 
+def actor_label(a):
+    """Role name, numbered for the two Defenders ('Defender 1', 'Defender 2')."""
+    return a.name.replace('-', ' ') if a.role == 'Defender' else a.role
+
+
 def draw_actor(a):
     x, y = int(OX+a.x), int(OY+a.y)
     if a is game.controlled_actor() and a.alive:
@@ -342,7 +347,8 @@ def draw_actor(a):
         pygame.draw.circle(screen, (252, 233, 187), (x, y + bob), 3)
     rect((22, 32, 34), (x-17, y-28, 34, 4), 2)
     rect((224, 104, 100) if a.hp < 40 else GREEN, (x-17, y-28, int(34*a.hp/100), 4), 2)
-    text(a.role, x-23, y+21, 12, color)
+    label = actor_label(a)
+    text(label, x - fonts[12].size(label)[0]//2, y+21, 12, color)
     if a.role == 'Student' and a.state == 'Waiting':
         radius = 9 + int((math.sin(game.elapsed * 5) + 1) * 2)
         pygame.draw.circle(screen, (241, 99, 95), (x, y-42), radius, 2)
@@ -411,13 +417,14 @@ def draw_action_effects():
     """Short, role-specific cues that make autonomous actions readable."""
     actors = {actor.name: actor for actor in game.actors}
     pulse = int((math.sin(game.elapsed * 12) + 1) * 2)
-    # A short amber tracer makes the Defender's shots visible without clutter.
-    defender, target = game.defender, game.defender_target
-    if defender.state == 'Engage' and defender.cooldown > .35 and target and target.alive:
-        start = (int(OX + defender.x), int(OY + defender.y - 6))
-        end = (int(OX + target.x), int(OY + target.y))
-        pygame.draw.line(screen, (248, 211, 112), start, end, 2)
-        pygame.draw.circle(screen, (255, 235, 168), start, 5 + pulse)
+    # A short amber tracer makes each Defender's shots visible without clutter.
+    for defender in game.defenders:
+        target = game.defender_targets.get(defender.name)
+        if defender.state == 'Engage' and defender.cooldown > .35 and target and target.alive:
+            start = (int(OX + defender.x), int(OY + defender.y - 6))
+            end = (int(OX + target.x), int(OY + target.y))
+            pygame.draw.line(screen, (248, 211, 112), start, end, 2)
+            pygame.draw.circle(screen, (255, 235, 168), start, 5 + pulse)
     # Healing is visible as a calm medical ring around the current patient.
     if game.medic.task.startswith('Heal '):
         patient = actors.get(game.medic.task.removeprefix('Heal '))
@@ -526,9 +533,9 @@ def draw():
     text(game.mission['title'].upper(), 946, 157, 14, GREEN)
     text(game.mission['objective'], 946, 175, 12, MUTED)
     text(f"{len(game.students)} students  |  {len(game.zombies)} zombies  |  {int(game.time)} sec", 946, 191, 12, MUTED)
-    for i, a in enumerate((game.leader, game.rescuer, game.medic, game.defender, game.scout, game.student)):
-        y = 208+i*21
-        text(a.role, 946, y, 14)
+    for i, a in enumerate((game.leader, game.rescuer, game.medic, *game.defenders, game.scout, game.student)):
+        y = 207+i*17
+        text(actor_label(a), 946, y, 13)
         rect((46, 60, 63), (1040, y+5, 100, 8), 4)
         rect(GREEN if a.hp > 35 else (237, 119, 110), (1040, y+5, int(a.hp), 8), 4)
     intel = 'STUDENT LOCATED' if game.discovered['Student'] else 'SCOUT SEARCHING FOR STUDENT'
@@ -549,10 +556,10 @@ def draw():
         rect((31, 46, 55), (944, 370, 232, 72), 5)
         text(action_help, 956, 385, 12, INK)
         text('WASD move  |  Shift run', 956, 412, 12, MUTED)
-    text('AI TASK ALLOCATION', 946, 513, 14, GREEN)
-    text(f'Scout: {game.scout.task}  [{game.scout.task_score}]', 946, 535, 12, MUTED)
-    text(f'Medic: {game.medic.task}  [{game.medic.task_score}]', 946, 553, 12, MUTED)
-    text(f'Defender: {game.defender.task}  [{game.defender.task_score}]', 946, 571, 12, MUTED)
+    text('AI TASK ALLOCATION', 946, 503, 14, GREEN)
+    for i, a in enumerate((game.scout, game.medic, *game.defenders)):
+        task = 'You are in control' if a is game.controlled_actor() else f'{a.task}  [{a.task_score}]'
+        text(f'{actor_label(a)}: {task}', 946, 524+i*16, 12, MUTED)
     text(f'Medkits: {game.medkits}  |  Ammo: {game.ammo}', 946, 589, 12, (126, 224, 195))
     text(f'Fuel secured: {game.fuel}/{game.fuel_required}', 946, 604, 12, (70, 160, 215))
     active_targets = [f'{z.name} -> {z.target_name}' for z in game.zombies if z.target_name]
@@ -617,7 +624,7 @@ def draw_menu():
             ('Commander', 'Coordinate the team and issue rescue orders.'),
             ('Rescuer', 'Reach located students and escort them to safety.'),
             ('Medic', 'Move to injured teammates and use medkits.'),
-            ('Defender', 'Protect the team and engage visible zombies.'),
+            ('Defender', 'Engage zombies alongside an AI Defender partner.'),
             ('Scout', 'Explore fog and scan nearby campus sectors.'),
         )
         for index, (role, description) in enumerate(roles):

@@ -1,8 +1,11 @@
+import math
 import unittest
+from unittest import mock
 import pygame
 from adaptive import train
 from fog import ALL_CELLS, BUILDING_FOOTPRINTS, CloudFog, FogField, visual_clear_cells
-from world import Game, WALLS, SAFE, ROWS, COLS, TILE, center, cell, pathfind, walkable
+from world import (Game, WALLS, SAFE, ROWS, COLS, TILE, LANDMARKS, ZOMBIE_PATROL, SCOUT_EVADE_RANGE,
+                   center, cell, pathfind, walkable)
 
 class MissionTests(unittest.TestCase):
     def test_ml_model_trains_after_fifteen_completed_missions(self):
@@ -96,6 +99,46 @@ class MissionTests(unittest.TestCase):
         self.assertEqual(game.defender.pos, position)
         self.assertEqual(game.defender.task, 'Down')
 
+    def test_defender_role_controls_one_defender_and_ai_runs_the_other(self):
+        game = Game(seed=7, player_role='Defender')
+        self.assertEqual([d.name for d in game.defenders], ['Defender-1', 'Defender-2'])
+        self.assertIs(game.controlled_actor(), game.defender)
+        self.assertIn(game.defender2, game.actors)
+        before = game.defender.pos
+        game.update(1 / 30, movement=(1, 0))
+        self.assertGreater(game.defender.x, before[0])  # the player moves Defender-1
+        self.assertEqual(game.defender.task, 'Idle')  # and no AI overrides it
+        self.assertNotEqual(game.defender2.task, 'Idle')  # Defender-2 makes its own decisions
+
+    def test_both_defenders_are_ai_for_every_other_role(self):
+        for role in ('Commander', 'Rescuer', 'Medic', 'Scout'):
+            game = Game(seed=7, player_role=role)
+            game.update(1 / 30)
+            self.assertNotIn(game.controlled_actor(), game.defenders)
+            self.assertTrue(all(d.task != 'Idle' for d in game.defenders), role)
+
+    def test_defenders_split_up_two_threats(self):
+        game = Game(seed=7)
+        for zombie in game.zombies[2:]:
+            zombie.hp = 0
+        first, second = game.zombies[:2]
+        for zombie, tile in ((first, (11, 17)), (second, (10, 15))):
+            zombie.x, zombie.y = center(tile); zombie.stun = 5; game.discovered[zombie.name] = True
+        for _ in range(30):
+            game.update(1 / 60)
+        targets = {game.defender_targets[d.name].name for d in game.defenders}
+        self.assertEqual(targets, {first.name, second.name})
+
+    def test_second_defender_covers_the_rescuer_when_no_zombie_is_sighted(self):
+        game = Game(seed=7)
+        for zombie in game.zombies:
+            zombie.hp = 0
+        game.rescuer.x, game.rescuer.y = center((12, 11))
+        game.command('Hold')
+        game.update(1 / 30)
+        self.assertEqual(game.defender.task, 'Guard Safe Zone')
+        self.assertEqual(game.defender2.task, 'Cover Rescuer')
+
     def test_full_generated_mission_completes(self):
         game = Game(seed=7); game.command('Rescue')
         for _ in range(60 * 360):
@@ -133,20 +176,90 @@ class MissionTests(unittest.TestCase):
         self.assertEqual(game.zombie.target_name, student.name)
         self.assertLess(student.hp, before)
 
-    def test_scout_commits_to_a_retreat_instead_of_flipping_tasks(self):
+    def test_scout_sidesteps_a_close_zombie_then_resumes_the_sweep(self):
+        game = Game(seed=7)
+        for zombie in game.zombies:
+            zombie.hp = 0
+        for defender in game.defenders:
+            defender.hp = 0  # nobody shoots the zombie during the check
+        threat = game.zombie
+        threat.hp = 100; threat.stun = 10  # a stunned zombie stays where it is put
+        start = center((12, 5))
+        game.scout.x, game.scout.y = start
+        threat.x, threat.y = center((13, 5))
+
+        tasks = []
+        for _ in range(30):
+            game.update(1 / 60)
+            tasks.append(game.scout.task)
+        # One committed sidestep: no task flipping and no run back to the Commander.
+        self.assertEqual(set(tasks), {f'Evade {threat.name}'})
+        self.assertGreater(math.dist(game.scout.pos, threat.pos), SCOUT_EVADE_RANGE)
+        self.assertLess(math.dist(game.scout.pos, start), 3.5 * TILE)
+
+        for _ in range(240):
+            game.update(1 / 60)
+            if game.scout.task.startswith('Explore'):
+                break
+        self.assertTrue(game.scout.task.startswith('Explore'), game.scout.task)
+
+    def test_scout_routes_around_a_sighted_zombie(self):
         game = Game(seed=7)
         for zombie in game.zombies:
             zombie.hp = 0
         threat = game.zombie
         threat.hp = 100
-        threat.x, threat.y = game.scout.x + 80, game.scout.y
+        threat.x, threat.y = center((15, 5))
+        self.assertEqual(game.zombie_danger(), {})  # an unseen zombie cannot be avoided
+        game.discovered[threat.name] = True
 
-        tasks = []
-        for _ in range(45):
+        direct = pathfind((10, 5), (22, 5))
+        detour = pathfind((10, 5), (22, 5), game.zombie_danger())
+        closest = lambda route: min(math.dist(tile, (15, 5)) for tile in route)
+        self.assertEqual(closest(direct), 0)  # the straight road runs through the zombie
+        self.assertGreaterEqual(closest(detour), 3)  # the Scout goes round the Lecture Hall
+        self.assertEqual(detour[-1], (22, 5))
+
+    def test_scout_searches_unguarded_fog_first_but_never_skips_fog(self):
+        game = Game(seed=7)
+        for zombie in game.zombies:
+            zombie.hp = 0
+        everything = [(x, y) for y in range(ROWS) for x in range(COLS)]
+        patch = lambda point: [(x, y) for y in range(point[1] - 3, point[1] + 4) for x in range(point[0] - 3, point[0] + 4)]
+        north, south = (11, 2), (11, 15)
+        game.revealed.update(everything)
+        game.revealed.difference_update(patch(north) + patch(south))
+        pick = lambda: game.scout_points[game.choose_scout_sector(game.scout.pos)]
+        first = pick()
+        guarded, other = (north, south) if math.dist(first, north) < math.dist(first, south) else (south, north)
+
+        threat = game.zombie
+        threat.hp = 100
+        threat.x, threat.y = center(guarded)
+        game.discovered[threat.name] = True
+        choice = pick()
+        self.assertLess(math.dist(choice, other), math.dist(choice, guarded))
+
+        # Once the guarded fog is all that is left, the Scout still goes for it.
+        game.revealed.update(patch(other))
+        self.assertGreater(game.scout_unseen_coverage(pick()), 0)
+
+    def test_scout_is_not_pinned_by_a_zombie_at_the_safe_zone_exit(self):
+        # The only way out of the Safe Zone is the corridor past (9,18), where
+        # zombies pushed out of the sanctuary used to wait and pin the Scout.
+        game = Game(seed=4, player_role='Defender')
+        for zombie in game.zombies[1:]:
+            zombie.hp = 0
+        game.defender2.hp = 0  # the AI Defender would otherwise shoot the guard
+        guard = game.zombie
+        evading = 0.0; farthest = 0.0
+        for _ in range(60 * 20):
+            guard.x, guard.y = center((9, 18)); guard.stun = 1
             game.update(1 / 60)
-            tasks.append(game.scout.task)
-
-        self.assertEqual(set(tasks), {'Avoid Zombie'})
+            evading += (1 / 60) * game.scout.task.startswith('Evade')
+            farthest = max(farthest, math.dist(game.scout.pos, center((5, 18))))
+        self.assertGreater(farthest, 8 * TILE)  # it got out and went scouting
+        self.assertLess(evading, 3.0)
 
     def test_scout_prioritizes_the_remaining_fog(self):
         game = Game(seed=7)
@@ -218,7 +331,7 @@ class MissionTests(unittest.TestCase):
         before_hp = game.zombie.hp
         game.player_action()
         self.assertLess(game.zombie.hp, before_hp)
-        self.assertIs(game.defender_target, game.zombie)
+        self.assertIs(game.defender_targets[game.defender.name], game.zombie)
 
     def test_player_scout_scan_discovers_visible_student(self):
         game = Game(seed=7, player_role='Scout')
@@ -270,6 +383,45 @@ class MissionTests(unittest.TestCase):
         self.assertEqual(game.leader.task, 'Coordinate Team')
         self.assertEqual(game.medic.task, 'Stage at Clinic')
         self.assertEqual(game.defender.task, 'Guard Safe Zone')
+
+    def test_zombie_patrol_stops_are_reachable_outdoor_tiles(self):
+        areas = {name: bounds for name, bounds, _ in LANDMARKS}
+        def inside(point, bounds):
+            x, y, w, h = bounds
+            return x <= point[0] < x + w and y <= point[1] < y + h
+        for stop in ZOMBIE_PATROL:
+            self.assertTrue(walkable(stop), stop)
+            self.assertTrue(pathfind((22, 11), stop), stop)
+            for bounds in (areas['PARKING'], areas['SECURITY'], SAFE):
+                self.assertFalse(inside(stop, bounds), stop)
+
+    def test_patrolling_zombies_never_freeze(self):
+        game = Game(seed=4)
+        game.command('Hold')
+        for defender in game.defenders:
+            defender.hp = 0  # nobody provokes the zombies, so they only patrol
+        last = {z.name: z.pos for z in game.zombies}
+        still = {z.name: 0 for z in game.zombies}
+        longest = 0
+        for _ in range(60 * 45):
+            game.update(1 / 60)
+            for zombie in game.zombies:
+                still[zombie.name] = still[zombie.name] + 1 if zombie.state == 'Patrol' and zombie.pos == last[zombie.name] else 0
+                last[zombie.name] = zombie.pos
+                longest = max(longest, still[zombie.name])
+        self.assertLess(longest, 60 * 2)
+
+    def test_zombie_skips_a_patrol_stop_it_cannot_reach(self):
+        with mock.patch('world.ZOMBIE_PATROL', ((14, 2), (13, 2))):  # (14, 2) is inside the Library
+            game = Game(seed=4)
+            for zombie in game.zombies[1:]:
+                zombie.hp = 0
+            for defender in game.defenders:
+                defender.hp = 0
+            game.zombie.x, game.zombie.y = center((22, 11))
+            game.update(1 / 60)
+            self.assertEqual(game.zombie.state, 'Patrol')
+            self.assertEqual(game.zombie.patrol, 1)
 
     def test_scout_sweeps_the_whole_campus_and_reports_back(self):
         game = Game(seed=4)

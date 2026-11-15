@@ -43,11 +43,11 @@ The Rescuer starts selected. Press E to dispatch, then head east along the
 central road to protect them. The purple student waits just east of Science.
 Stay close and use Space against the zombie. The student follows the Rescuer
 once contacted. The Commander, Rescuer, and student must survive; the Medic
-and Defender support the mission autonomously.
+and the two Defenders support the mission autonomously.
 
 ## Multi-agent behavior
 
-The Commander assigns the rescue task. The Medic and Defender make their own
+The Commander assigns the rescue task. The Medic and Defenders make their own
 choices with the shared scoring rule `priority + role suitability - distance -
 risk`, displayed in **AI TASK ALLOCATION** on the right side of the game.
 
@@ -57,9 +57,13 @@ risk`, displayed in **AI TASK ALLOCATION** on the right side of the game.
   found the student.
 - The **Medic** selects the most urgent nearby patient, uses up to three
   medkits, and returns to supporting the escort when nobody needs treatment.
-- The **Defender** selects the teammate facing the largest zombie threat,
-  moves to intercept, attacks at close range, and deliberately draws the
-  zombie's attention away from the rescue party.
+- Two **Defenders** each select the teammate facing the largest zombie threat,
+  move to intercept, attack at close range, and deliberately draw the
+  zombie's attention away from the rescue party. They split up: each takes a
+  zombie the other is not already fighting, and only double up when every
+  sighted zombie is covered. With nothing in sight, Defender 1 guards the Safe
+  Zone and Defender 2 covers the Rescuer in the field. If you play the
+  Defender role you control Defender 1 and Defender 2 stays an AI partner.
 
 ## Verify
 
