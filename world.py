@@ -7,16 +7,50 @@ import random
 from pathlib import Path
 
 TILE=32; COLS,ROWS=28,20
-BUILDINGS=[(1,1,8,4,'ADMIN BLOCK'),(14,1,7,4,'LIBRARY'),(1,7,9,4,'SCIENCE LAB'),(16,7,6,4,'LECTURE HALL'),(1,13,9,4,'HOSTEL'),(12,13,8,4,'CAFETERIA'),(21,13,6,5,'SPORTS COURT')]
-WALLS={(x,y) for bx,by,w,h,_ in BUILDINGS for x in range(bx,bx+w) for y in range(by,by+h)}
-SAFE=(3,17,5,3)
+# Walkable ground, traced tile by tile from the campus map art
+# (assets/generated/campus-game-map-v4.png). '#' is blocked: buildings, fences,
+# the perimeter wall, the fountain, parked cars, the guard house and gazebo.
+# '.' is open ground: roads, paths, plazas and lawns.
+#  x: 0         1         2
+#     0123456789012345678901234567
+CAMPUS_MAP=(
+    '############################',  # 0  perimeter wall
+    '#########.....######..#.#..#',  # 1  Admin Block | Library | parked cars
+    '#########.....######.......#',  # 2
+    '#########.....######..#.#..#',  # 3
+    '#..........................#',  # 4  lawns in front of Admin and Library
+    '#......................#####',  # 5  main road | security gate, fences, guard house
+    '#.#######.......#####....###',  # 6  Science Lab | plaza | Lecture Hall | guard house
+    '#.#######.......#####.....##',  # 7  ... | security yard fence
+    '#.#######...#...#####......#',  # 8  fountain in the plaza
+    '#.#######...#...#####......#',  # 9
+    '#..........................#',  # 10 paths in front of Science Lab and Lecture Hall
+    '#..........................#',  # 11 main road
+    '#.######...#######.........#',  # 12 Hostel | Cafeteria | lawn above the court
+    '#.######...#######..########',  # 13 ... | path between Cafeteria and court | fenced court
+    '#.######...#######..########',  # 14
+    '##########.#######..########',  # 15 park fence behind the Hostel
+    '#........#..........########',  # 16 park (Safe Zone) | park fence | in front of Cafeteria
+    '#.#.................########',  # 17 gazebo | park gate at (9,17) | court fence
+    '#........#.................#',  # 18 park | fence by the tree | road and lawns
+    '############################',  # 19 perimeter wall
+)
+assert len(CAMPUS_MAP)==ROWS and all(len(row)==COLS for row in CAMPUS_MAP)
+WALLS={(x,y) for y,row in enumerate(CAMPUS_MAP) for x,ch in enumerate(row) if ch=='#'}
+# Building footprints (for labels and fog); every footprint tile is blocked above.
+BUILDINGS=[(1,1,8,3,'ADMIN BLOCK'),(14,1,6,3,'LIBRARY'),(2,6,7,4,'SCIENCE LAB'),(16,6,5,4,'LECTURE HALL'),(2,12,6,3,'HOSTEL'),(11,12,7,4,'CAFETERIA'),(20,13,7,5,'SPORTS COURT')]
+# The Safe Zone sits in the fenced park behind the Hostel. Its only way in is
+# the gate at SAFE_GATE in the park's east fence; SAFE_EXIT is just outside it.
+SAFE=(3,17,5,2)
+SAFE_GATE=(9,17)
+SAFE_EXIT=(10,17)
 # Logical campus landmarks. They anchor resource placement and appear on the map.
-LANDMARKS=[('CLINIC',(10,12,2,2),'medkit'),('SECURITY',(25,5,2,3),'ammo'),('GENERATOR',(10,17,2,2),'fuel'),('PARKING',(22,1,5,4),'parking')]
+LANDMARKS=[('CLINIC',(9,12,2,2),'medkit'),('SECURITY',(25,5,2,3),'ammo'),('GENERATOR',(10,17,2,2),'fuel'),('PARKING',(22,1,5,4),'parking')]
 # Zombie patrol loop around the east-central campus. Every stop must be an
 # outdoor tile A* can reach, outside Parking, Security and the Safe Zone.
 # (14,2) used to sit inside the Library walls, so any zombie heading there had
 # no route and froze; (25,2) was inside the Parking lot.
-ZOMBIE_PATROL=((25,10),(24,5),(13,2),(14,10))
+ZOMBIE_PATROL=((25,10),(23,7),(13,2),(14,10))
 # Scout reconnaissance. The Scout routes around zombies it has sighted, only
 # sidesteps one that comes within reach, and keeps sweeping the campus.
 SCOUT_EVADE_RANGE=64    # px: a visible zombie this close makes the Scout sidestep
@@ -42,10 +76,9 @@ def safe_gap(p):
     x0,y0=SAFE[0]*TILE,SAFE[1]*TILE; x1,y1=x0+SAFE[2]*TILE,y0+SAFE[3]*TILE
     return math.hypot(max(x0-p[0],0,p[0]-x1),max(y0-p[1],0,p[1]-y1))
 def walkable(p):
-    """Outdoor campus routes; the fenced map edge and buildings are inaccessible."""
+    """Open ground on the campus map (see CAMPUS_MAP)."""
     x, y = p
-    in_safe_zone = SAFE[0] <= x < SAFE[0]+SAFE[2] and SAFE[1] <= y < SAFE[1]+SAFE[3]
-    return ((1 <= x < COLS-1 and 1 <= y < ROWS-1) or in_safe_zone) and p not in WALLS
+    return 0 <= x < COLS and 0 <= y < ROWS and p not in WALLS
 def pathfind(start,goal,avoid=None):
     """A* over walkable tiles. `avoid` maps tiles to an extra step cost, which
     bends a route away from danger without ever blocking it."""
@@ -97,10 +130,10 @@ class Game:
                       'zombies':base_mission['zombies'] + sector_pressure,
                       'time':max(180, base_mission['time'] - sector_pressure*30),
                       'sector':self.campaign_level}
-        zombie_spawn_pool=((11,3),(13,6),(22,6),(24,10),(11,11),(14,12),(22,11),(10,17),(20,18),(25,9),(10,6),(23,18),(12,1))
+        zombie_spawn_pool=((11,3),(13,6),(22,6),(24,10),(11,11),(19,14),(22,11),(10,17),(20,18),(25,9),(10,6),(23,18),(12,1))
         team_start=((4,18),(5,18),(3,18),(6,18),(5,17),(7,18))
         zombie_spawn_pool=tuple(point for point in zombie_spawn_pool if all(math.dist(point, member) >= 5 for member in team_start))
-        rescue_points=((10,3),(13,4),(21,4),(10,8),(15,8),(22,8),(10,10),(15,10),(22,10),(10,15),(11,16),(20,15),(20,17),(25,11))
+        rescue_points=((10,3),(13,4),(21,4),(10,8),(15,8),(22,8),(10,10),(15,10),(22,10),(10,15),(11,16),(19,15),(22,18),(25,11))
         # Choose a zombie layout that leaves enough safe, separate positions for
         # every required student. Higher sectors otherwise occasionally created
         # an impossible random mission before the game window could open.
@@ -118,7 +151,7 @@ class Game:
         self.zombies=[Actor(*center(c),'Zombie',f'Zombie-{i+1}',state='Patrol') for i,c in enumerate(zombie_spawns)]
         resource_sites={
             'medkit':(('Clinic Medkit',(10,12)),('Hostel First-Aid Kit',(10,16)),('Cafeteria Medkit',(20,12))),
-            'ammo':(('Security Ammo',(25,6)),('Admin Security Locker',(10,4)),('Sports Equipment Locker',(20,17))),
+            'ammo':(('Security Ammo',(24,6)),('Admin Security Locker',(10,4)),('Sports Equipment Locker',(21,18))),
             'fuel':(('Generator Fuel',(10,18)),('Parking Fuel Can',(22,5)),('Science Lab Fuel',(10,11))),
         }
         selected_resources=[]
@@ -129,7 +162,7 @@ class Game:
         # In a field-role mission the player is part of an autonomous rescue
         # unit, so the AI Rescuer begins acting on Scout intelligence at once.
         # Commander mode keeps the explicit Follow order for player direction.
-        base_scout_points=[(11,2),(22,3),(11,8),(23,8),(11,15),(20,15),(25,11)]
+        base_scout_points=[(11,2),(23,3),(11,8),(23,8),(10,15),(19,15),(25,11)]
         # Cover every outdoor part of the campus. The former short list could
         # clear its own patrol stops while leaving a survivor hidden elsewhere.
         grid_scout_points=[(x,y) for y in range(2,ROWS-1,4) for x in range(2,COLS-1,4) if walkable((x,y))]
@@ -441,7 +474,7 @@ class Game:
         # it, and it abandons a stale chase that would take it into the sanctuary.
         if in_safe_zone(z.pos):
             z.target_name=''; z.last_seen=None; z.search_time=0; z.state='Retreat'
-            self.navigate(z,center((SAFE[0]+SAFE[2]+1, SAFE[1]+SAFE[3]//2)),66,dt,8)
+            self.navigate(z,center(SAFE_EXIT),66,dt,8)
             return
         # Prey that reached the Safe Zone (or was evacuated) has escaped. The
         # zombie forgets it at once instead of waiting at the gate, and looks for

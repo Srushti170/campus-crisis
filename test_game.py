@@ -6,7 +6,7 @@ from adaptive import train
 from fog import ALL_CELLS, BUILDING_FOOTPRINTS, CloudFog, FogField, visual_clear_cells
 from sprites import GAME_HEIGHT, DEFAULT_HEIGHT, ROLES, build_character_sprites
 from world import (Game, WALLS, SAFE, ROWS, COLS, TILE, LANDMARKS, ZOMBIE_PATROL, SCOUT_EVADE_RANGE,
-                   SAFE_KEEP_OUT, center, cell, in_safe_zone, pathfind, safe_gap, walkable)
+                   SAFE_KEEP_OUT, SAFE_EXIT, SAFE_GATE, BUILDINGS, center, cell, in_safe_zone, pathfind, safe_gap, walkable)
 
 class MissionTests(unittest.TestCase):
     def test_ml_model_trains_after_fifteen_completed_missions(self):
@@ -52,8 +52,8 @@ class MissionTests(unittest.TestCase):
         game = Game(seed=7); before = len(game.revealed)
         for zombie in game.zombies:
             zombie.hp = 0
-        game.student.x, game.student.y = center((24, 4))
-        game.scout.x, game.scout.y = center((25, 8)); game.update(1/60)
+        game.student.x, game.student.y = center((21, 4))
+        game.scout.x, game.scout.y = center((21, 8)); game.update(1/60)
         self.assertGreater(len(game.revealed), before)
         self.assertTrue(game.discovered['Student-1'])
         self.assertTrue(any('survivor found' in line for line in game.logs))
@@ -138,13 +138,13 @@ class MissionTests(unittest.TestCase):
     def test_zombie_cannot_walk_into_the_safe_zone(self):
         game = Game(seed=7)
         zombie = game.zombie
-        zombie.x, zombie.y = center((10, 18))
+        zombie.x, zombie.y = center(SAFE_EXIT)
         for _ in range(120):
-            game.move(zombie, -3, 0)  # keep pushing west towards the Safe Zone gate
+            game.move(zombie, -3, 0)  # keep pushing west through the park gate
         self.assertFalse(in_safe_zone(zombie.pos))
         self.assertGreaterEqual(safe_gap(zombie.pos), SAFE_KEEP_OUT)
         rescuer = game.rescuer
-        rescuer.x, rescuer.y = center((10, 18))
+        rescuer.x, rescuer.y = center(SAFE_EXIT)
         for _ in range(60):
             game.move(rescuer, -3, 0)
         self.assertTrue(in_safe_zone(rescuer.pos))  # the team walks straight in
@@ -158,9 +158,9 @@ class MissionTests(unittest.TestCase):
         zombie, student, earlier = game.zombie, game.students[0], game.students[1]
         earlier.state = 'Rescued'; earlier.x, earlier.y = center((8, 17))  # standing by the gate
         student.state = 'Following'; game.escort_student = student
-        game.rescuer.x, game.rescuer.y = center((13, 18))
-        student.x, student.y = center((14, 18))
-        zombie.x, zombie.y = center((17, 18))
+        game.rescuer.x, game.rescuer.y = center((13, 17))  # heading west to the park gate
+        student.x, student.y = center((14, 17))
+        zombie.x, zombie.y = center((17, 17))
         states_after_rescue = []
         for _ in range(60 * 8):
             walking = (-1, 0) if cell(game.rescuer.pos)[0] > 4 else (0, 0)
@@ -352,8 +352,8 @@ class MissionTests(unittest.TestCase):
         self.assertGreater(game.scout_unseen_coverage(pick()), 0)
 
     def test_scout_is_not_pinned_by_a_zombie_at_the_safe_zone_exit(self):
-        # The only way out of the Safe Zone is the corridor past (9,18), where
-        # zombies pushed out of the sanctuary used to wait and pin the Scout.
+        # The only way out of the Safe Zone is the park gate. A zombie waiting
+        # just outside it used to pin the Scout inside.
         game = Game(seed=4, player_role='Defender')
         for zombie in game.zombies[1:]:
             zombie.hp = 0
@@ -361,7 +361,7 @@ class MissionTests(unittest.TestCase):
         guard = game.zombie
         evading = 0.0; farthest = 0.0
         for _ in range(60 * 20):
-            guard.x, guard.y = center((9, 18)); guard.stun = 1
+            guard.x, guard.y = center(SAFE_EXIT); guard.stun = 1
             game.update(1 / 60)
             evading += (1 / 60) * game.scout.task.startswith('Evade')
             farthest = max(farthest, math.dist(game.scout.pos, center((5, 18))))
@@ -444,8 +444,8 @@ class MissionTests(unittest.TestCase):
         game = Game(seed=7, player_role='Scout')
         for zombie in game.zombies:
             zombie.hp = 0
-        game.student.x, game.student.y = center((24, 4))
-        game.scout.x, game.scout.y = center((25, 8))
+        game.student.x, game.student.y = center((21, 4))
+        game.scout.x, game.scout.y = center((21, 8))
         game.player_action()
         self.assertTrue(game.discovered['Student-1'])
 
@@ -459,8 +459,8 @@ class MissionTests(unittest.TestCase):
         game = Game(seed=7, player_role='Scout')
         for zombie in game.zombies:
             zombie.hp = 0
-        game.student.x, game.student.y = center((24, 4))
-        game.scout.x, game.scout.y = center((25, 8))
+        game.student.x, game.student.y = center((21, 4))
+        game.scout.x, game.scout.y = center((21, 8))
         game.update(1 / 30)
         self.assertEqual(game.order, 'Rescue')
         self.assertTrue(game.discovered['Student-1'])
@@ -556,6 +556,47 @@ class MissionTests(unittest.TestCase):
         unsearched = [c for c in ALL_CELLS if walkable(c) and c not in game.revealed]
         self.assertEqual(unsearched, [])
         self.assertEqual([c for c in ALL_CELLS if c not in visual_clear_cells(game.revealed)], [])
+
+
+class CampusMapTests(unittest.TestCase):
+    """The walkable grid must match the campus art (see CAMPUS_MAP in world.py)."""
+
+    def test_path_between_cafeteria_and_sports_court_is_open(self):
+        for y in range(12, 19):
+            self.assertTrue(walkable((18, y)) and walkable((19, y)), y)
+
+    def test_fenced_sports_court_is_blocked(self):
+        for x in range(20, 27):
+            for y in range(13, 18):
+                self.assertFalse(walkable((x, y)), (x, y))
+            self.assertTrue(walkable((x, 12)) and walkable((x, 18)), x)  # lawns either side of the fence
+
+    def test_every_building_is_solid(self):
+        for bx, by, w, h, name in BUILDINGS:
+            for x in range(bx, bx + w):
+                for y in range(by, by + h):
+                    self.assertFalse(walkable((x, y)), (name, x, y))
+
+    def test_every_open_tile_is_reachable_from_the_safe_zone(self):
+        home = (SAFE[0] + 2, SAFE[1] + 1)
+        open_tiles = [(x, y) for y in range(ROWS) for x in range(COLS) if walkable((x, y))]
+        self.assertEqual([t for t in open_tiles if t != home and not pathfind(home, t)], [])
+
+    def test_the_park_gate_is_the_only_way_into_the_safe_zone(self):
+        home = (SAFE[0] + 2, SAFE[1] + 1)
+        self.assertTrue(pathfind(SAFE_EXIT, home))
+        with mock.patch('world.WALLS', set(WALLS) | {SAFE_GATE}):
+            self.assertEqual(pathfind(SAFE_EXIT, home), [])
+
+    def test_every_mission_places_people_and_items_on_open_ground(self):
+        for sector in (1, 2, 3):
+            for seed in range(25):
+                game = Game(seed=seed, campaign_level=sector)
+                for thing in (*game.actors, *game.pickups):
+                    self.assertTrue(walkable(cell(thing.pos)), (sector, seed, getattr(thing, 'name', ''), cell(thing.pos)))
+        game = Game(seed=1)
+        for point in (*ZOMBIE_PATROL, *game.scout_points):
+            self.assertTrue(walkable(point), point)
 
 
 class SpriteTests(unittest.TestCase):

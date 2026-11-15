@@ -49,6 +49,7 @@ def _building_footprints():
 
 
 BUILDING_FOOTPRINTS = _building_footprints()
+BUILDING_CELLS = set().union(*(cells for cells, _ in BUILDING_FOOTPRINTS))
 
 
 def visual_clear_cells(revealed):
@@ -64,6 +65,12 @@ def visual_clear_cells(revealed):
         seen = sum(c in revealed for c in cells)
         if seen >= len(cells) * BUILDING_CLEAR_FRACTION or around <= revealed:
             clear.update(cells)
+    # Smaller obstacles (fences, the fountain, parked cars, the gazebo) clear as
+    # soon as anything beside them has been seen.
+    for x, y in ALL_CELLS:
+        if (x, y) not in clear and not walkable((x, y)) and (x, y) not in BUILDING_CELLS:
+            if any((x + dx, y + dy) in revealed for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))):
+                clear.add((x, y))
     for x, y in ALL_CELLS:
         on_edge = x in (0, COLS - 1) or y in (0, ROWS - 1)
         if on_edge and not walkable((x, y)):

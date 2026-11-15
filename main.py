@@ -23,7 +23,7 @@ else:
     os.environ.setdefault('SDL_WINDOWS_DPI_AWARENESS', 'permonitorv2')
     os.environ.setdefault('SDL_RENDER_SCALE_QUALITY', 'linear')
 import pygame
-from world import Game, TILE, COLS, ROWS, BUILDINGS, SAFE, LANDMARKS, center
+from world import Game, TILE, COLS, ROWS, BUILDINGS, SAFE, SAFE_GATE, LANDMARKS, center
 from fog import CloudFog
 from sprites import build_character_sprites
 from adaptive import recommend, report
@@ -132,6 +132,28 @@ def reset_campaign():
 GRASS = load_asset('PNG/Tiles/tile_01.png', (TILE, TILE))
 REALISTIC_CAMPUS = (pygame.transform.smoothscale(pygame.image.load(REALISTIC_MAP_PATH).convert(), (COLS*TILE, ROWS*TILE))
                     if REALISTIC_MAP_PATH.exists() else None)
+
+
+def open_park_gate(campus):
+    """Paint the Safe Zone park's gate into the map art.
+
+    The art fences the park on every side; the game's one way in is the gate at
+    SAFE_GATE in the east fence. A paved path is laid through the fence there,
+    copied from the pavement just outside, with a post on each side.
+    """
+    gx, gy = SAFE_GATE
+    top = gy * TILE + 3
+    # A clean stretch of the pavement outside, two tiles up (clear of the lamp by the gate).
+    pavement = campus.subsurface(((gx + 1) * TILE - 4, (gy - 2) * TILE + 10, 12, TILE - 6)).copy()
+    for x in range(gx * TILE + 2, (gx + 1) * TILE + 2, 10):
+        campus.blit(pavement, (x, top))
+    for post_y in (top - 7, top + TILE - 7):
+        pygame.draw.rect(campus, (52, 56, 60), ((gx + 1) * TILE - 13, post_y, 7, 11), border_radius=2)
+        pygame.draw.rect(campus, (122, 128, 130), ((gx + 1) * TILE - 13, post_y, 7, 3), border_radius=1)
+
+
+if REALISTIC_CAMPUS:
+    open_park_gate(REALISTIC_CAMPUS)
 # Painted semi-realistic characters, drawn in code (see sprites.py). Each role
 # has a standing frame and two walking steps, facing right and mirrored left.
 CHARACTER_SPRITES = build_character_sprites()
