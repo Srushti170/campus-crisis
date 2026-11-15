@@ -2,6 +2,7 @@
 import argparse
 import math
 import os
+import random
 from array import array
 from pathlib import Path
 
@@ -9,6 +10,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--smoke-test', action='store_true', help='Render 120 frames without a window')
 parser.add_argument('--screenshot', type=str, help='Save a frame and exit')
 parser.add_argument('--preview-game', action='store_true', help='Open directly into a mission for visual review')
+parser.add_argument('--state', type=str, help='Start on a given menu screen (menu/briefing/role_select/howto) for visual review')
 args = parser.parse_args()
 HEADLESS = bool(args.smoke_test or args.screenshot)
 if HEADLESS:
@@ -55,6 +57,8 @@ mission_outcome_processed = False
 mute_button = pygame.Rect(1052, 45, 130, 32)
 if args.preview_game:
     screen_state = 'game'
+if args.state:
+    screen_state = args.state
 ASSET_ROOT = Path(__file__).parent / 'assets' / 'kenney-top-down-shooter'
 REALISTIC_MAP_PATH = Path(__file__).parent / 'assets' / 'generated' / 'campus-game-map-v4.png'
 
@@ -142,6 +146,243 @@ def menu_button(key, label, bounds, accent=False):
     rect(GREEN if accent else (91, 117, 125), bounds, 7, 1)
     rendered = fonts[16].render(label, True, INK)
     screen.blit(rendered, rendered.get_rect(center=menu_buttons[key].center))
+
+
+# ---------------------------------------------------------------------------
+# UI redesign toolkit: shared accents, text clipping and drawn icons.
+# ---------------------------------------------------------------------------
+AMBER, DANGER = (244, 195, 109), (218, 80, 77)
+AMBER_TEXT, DANGER_TEXT = (244, 208, 104), (250, 148, 136)
+MENU_CARD = pygame.Rect(244, 84, 712, 600)   # every menu screen shares one card
+
+
+def clip_text(value, x, y, size, color, max_width):
+    """Draw text truncated with an ellipsis so it never overflows its column."""
+    font, value = fonts[size], str(value)
+    if font.size(value)[0] > max_width:
+        while value and font.size(value + '…')[0] > max_width:
+            value = value[:-1]
+        value += '…'
+    text(value, x, y, size, color)
+
+
+def wrap_line(line, max_chars):
+    """Split a log line into screen-width-sized chunks, newest message first."""
+    words, lines, current = line.split(), [], ''
+    for word in words:
+        if current and len(current + word) > max_chars:
+            lines.append(current.rstrip())
+            current = ''
+        current += word + ' '
+    if current:
+        lines.append(current.rstrip())
+    return lines
+
+
+def draw_icon_person(x, y, color=(238, 238, 228)):
+    pygame.draw.circle(screen, color, (x, y - 3), 3)
+    pygame.draw.polygon(screen, color, [(x - 3, y + 6), (x + 3, y + 6), (x + 2, y), (x - 2, y)])
+
+
+def draw_icon_skull(x, y, color=(236, 90, 84)):
+    pygame.draw.circle(screen, color, (x, y - 2), 4)
+    pygame.draw.rect(screen, color, (x - 2, y + 1, 4, 4), border_radius=1)
+    pygame.draw.circle(screen, (16, 26, 32), (x - 1, y - 2), 1)
+    pygame.draw.circle(screen, (16, 26, 32), (x + 1, y - 2), 1)
+
+
+def draw_icon_clock(x, y, color=AMBER):
+    pygame.draw.circle(screen, color, (x, y), 5, 1)
+    pygame.draw.line(screen, color, (x, y), (x, y - 3), 1)
+    pygame.draw.line(screen, color, (x, y), (x + 2, y + 1), 1)
+
+
+def draw_icon_medkit(x, y):
+    rect((218, 80, 77), (x - 7, y - 5, 14, 11), 2)
+    rect((248, 242, 226), (x - 1, y - 3, 2, 7))
+    rect((248, 242, 226), (x - 3, y - 1, 7, 3))
+
+
+def draw_icon_ammo(x, y, color=(234, 180, 69)):
+    for offset in (-4, 0, 4):
+        rect((64, 49, 37), (x + offset - 1, y - 5, 3, 10), 1)
+        rect(color, (x + offset - 1, y - 5, 3, 3), 1)
+
+
+def draw_icon_fuel(x, y, color=(70, 160, 215)):
+    rect((36, 53, 58), (x - 5, y - 5, 10, 11), 2)
+    rect(color, (x - 3, y - 3, 6, 7), 1)
+    rect(color, (x + 1, y - 7, 3, 3))
+
+
+def draw_star(cx, cy, radius, color):
+    points = []
+    for i in range(10):
+        ray = radius if i % 2 == 0 else radius * .45
+        angle = -math.pi / 2 + i * math.pi / 5
+        points.append((cx + ray * math.cos(angle), cy + ray * math.sin(angle)))
+    pygame.draw.polygon(screen, color, points)
+
+
+def draw_warning_icon(cx, cy, color=DANGER_TEXT):
+    pygame.draw.polygon(screen, color, [(cx, cy - 6), (cx + 6, cy + 5), (cx - 6, cy + 5)])
+    rect((16, 26, 32), (cx - 1, cy - 2, 2, 4))
+    rect((16, 26, 32), (cx - 1, cy + 3, 2, 2))
+
+
+def draw_divider(y, x=946, width=228):
+    rect(PANEL_EDGE, (x, y, width, 1))
+
+
+# ---------------------------------------------------------------------------
+# Menu atmosphere: layered backdrop, title glitch, role lineup, campaign strip.
+# ---------------------------------------------------------------------------
+def build_glow(color, radius, peak_alpha=26):
+    """Soft radial light pool; brightest at the centre, fading to nothing."""
+    surf = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+    for step in range(12):
+        share = step / 11
+        pygame.draw.circle(surf, (*color, int(peak_alpha * share * share)),
+                           (radius, radius), max(2, int(radius * (1 - step / 12))))
+    return surf
+
+
+random.seed(11)
+GLOWS = ((build_glow((36, 160, 118), 300, 30), (200, 170), 1.1, .9),
+         (build_glow((30, 110, 150), 240, 24), (900, 540), -.9, 1.2),
+         (build_glow((140, 120, 60), 210, 18), (640, 60), .7, -1.1))
+FOG_MOTES = [{'x': random.uniform(0, WIDTH), 'y': random.uniform(0, HEIGHT),
+              'v': random.uniform(9, 24), 'r': int(random.uniform(2, 5)),
+              'a': random.randint(22, 52), 'phase': random.uniform(0, 6.3)} for _ in range(34)]
+SCAN_OVERLAY = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+for scan_y in range(0, HEIGHT, 4):
+    pygame.draw.line(SCAN_OVERLAY, (120, 220, 190, 9), (0, scan_y), (WIDTH, scan_y))
+VIGNETTE = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+for vignette_step in range(12):
+    inset = vignette_step * 12
+    pygame.draw.rect(VIGNETTE, (3, 8, 12, 9 + vignette_step * 2),
+                     (inset, inset, WIDTH - inset * 2, HEIGHT - inset * 2), width=14, border_radius=40)
+LINEUP = (('Leader', 'COMMAND'), ('Rescuer', 'RESCUE'), ('Medic', 'HEAL'),
+          ('Defender', 'DEFEND'), ('Scout', 'SCOUT'))
+
+
+def draw_menu_backdrop(t):
+    """Base darkness, drifting light pools, rising motes, scan lines, vignette."""
+    screen.fill((12, 23, 29))
+    for surf, (base_x, base_y), vx, vy in GLOWS:
+        x = base_x + math.sin(t * vx) * 40
+        y = base_y + math.cos(t * vy) * 30
+        screen.blit(surf, (x - surf.get_width() // 2, y - surf.get_height() // 2))
+    motes = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    for mote in FOG_MOTES:
+        y = (mote['y'] - t * mote['v']) % (HEIGHT + 20) - 10
+        x = (mote['x'] + math.sin(t * .5 + mote['phase']) * 18) % WIDTH
+        pygame.draw.circle(motes, (110, 220, 185, mote['a']), (int(x), int(y)), mote['r'])
+    screen.blit(motes, (0, 0))
+    offset = int(t * 26) % 4
+    screen.blit(SCAN_OVERLAY, (0, offset - HEIGHT))
+    screen.blit(SCAN_OVERLAY, (0, offset))
+    screen.blit(VIGNETTE, (0, 0))
+
+
+def draw_menu_card():
+    rect((24, 38, 45), MENU_CARD, 14)
+    rect((74, 129, 117), MENU_CARD, 14, 2)
+
+
+def draw_menu_title(x, y):
+    """CAMPUS / CRISIS with a brief RGB-split glitch on the slash every few seconds."""
+    t = pygame.time.get_ticks() / 1000
+    left, slash, right = 'CAMPUS ', '/', ' CRISIS'
+    slash_x = x + fonts[48].size(left)[0]
+    phase = t % 3.4
+    if phase < .16:  # glitch window: channel-split copies with a jitter offset
+        off = 2 if int(phase * 30) % 2 else -2
+        text(left, x, y, 48)
+        text(right, slash_x + fonts[48].size(slash)[0] + off // 2, y, 48)
+        text(slash, slash_x + off - 2, y + off, 48, (236, 90, 84))
+        text(slash, slash_x + off + 2, y - off, 48, (110, 231, 190))
+        text(slash, slash_x + off // 2, y, 48)
+    else:
+        text(left, x, y, 48)
+        text(slash, slash_x, y, 48)
+        text(right, slash_x + fonts[48].size(slash)[0], y, 48)
+
+
+def draw_scan_line(x, y, width, t):
+    """Thin pulsing divider with a bright segment sweeping left to right."""
+    pulse = .25 + .2 * math.sin(t * 2)
+    dim = tuple(int(channel * pulse) for channel in GREEN)
+    rect(dim, (x, y, width, 1))
+    sweep = int((t * 90) % (width + 80)) - 40
+    rect(GREEN, (x + sweep, y, 60, 1))
+
+
+def draw_lineup(t):
+    """The five playable roles on their colour rings, gently idling."""
+    left, width, base_y = 314, 572, 368
+    slot = width / len(LINEUP)
+    mouse = pygame.mouse.get_pos()
+    for i, (role, verb) in enumerate(LINEUP):
+        cx = int(left + (i + .5) * slot)
+        color = ROLE_COLORS[role]
+        hovered = math.hypot(mouse[0] - cx, mouse[1] - (base_y - 34)) < 44
+        bob = int(math.sin(t * 2 + i * .9) * 3)
+        scale = 1.34 if hovered else 1.0
+        sprite = CHARACTER_SPRITES[role]['right'][0]
+        size = (int(sprite.get_width() * scale), int(sprite.get_height() * scale))
+        shown = pygame.transform.smoothscale(sprite, size) if scale != 1 else sprite
+        ring = 46 if hovered else 40
+        pygame.draw.ellipse(screen, (16, 30, 36), (cx - ring // 2, base_y - 6, ring, 16))
+        pygame.draw.ellipse(screen, color, (cx - ring // 2, base_y - 6, ring, 16), 2)
+        screen.blit(shown, shown.get_rect(midbottom=(cx, base_y + 9 + bob)))
+        label = fonts[12].render(verb, True, color)
+        screen.blit(label, label.get_rect(midtop=(cx, base_y + 14)))
+
+
+def draw_cta(key, label, bounds, play_icon=False):
+    """Primary call-to-action: filled, tallest, with a breathing glow edge."""
+    bounds = pygame.Rect(bounds)
+    menu_buttons[key] = bounds
+    hovered = menu_buttons[key].collidepoint(pygame.mouse.get_pos())
+    t = pygame.time.get_ticks() / 1000
+    pulse = int((46 if hovered else 22) * (.5 + .5 * math.sin(t * 3)))
+    glow = pygame.Surface((bounds.width + 12, bounds.height + 12), pygame.SRCALPHA)
+    pygame.draw.rect(glow, (*GREEN, (150 if hovered else 70) + pulse),
+                     (0, 0, glow.get_width(), glow.get_height()), width=4, border_radius=14)
+    screen.blit(glow, (bounds.x - 6, bounds.y - 6))
+    rect((78, 152, 122) if hovered else (55, 130, 102), bounds, 10)
+    rect(GREEN, bounds, 10, 2)
+    rendered = fonts[18].render(label, True, (238, 250, 244))
+    spot = rendered.get_rect(center=menu_buttons[key].center)
+    if play_icon:  # a drawn play triangle beats a glyph that may not exist in the font
+        pygame.draw.polygon(screen, (238, 250, 244),
+                            [(spot.left - 26, spot.centery - 7), (spot.left - 26, spot.centery + 7), (spot.left - 12, spot.centery)])
+    screen.blit(rendered, spot)
+
+
+def draw_ghost(key, label, bounds, size=16):
+    """Secondary action: half-width, outline-only, quiet until hovered."""
+    menu_buttons[key] = pygame.Rect(bounds)
+    hovered = menu_buttons[key].collidepoint(pygame.mouse.get_pos())
+    rect((30, 48, 56) if hovered else (22, 36, 42), bounds, 7)
+    rect((96, 124, 130) if hovered else (74, 100, 108), bounds, 7, 1)
+    rendered = fonts[size].render(label, True, INK if hovered else MUTED)
+    screen.blit(rendered, rendered.get_rect(center=menu_buttons[key].center))
+
+
+def draw_campaign_strip(t):
+    """Thin status bar under the menu card: sector progress and rescue record."""
+    sector, rescued = campaign['unlocked_sector'], campaign['completed']
+    progress = (sector - 1) / 3
+    text(f'SECTOR {sector}/3', 250, 734, 12, AMBER)
+    bar = pygame.Rect(340, 738, 300, 6)
+    rect((30, 46, 52), bar, 3)
+    rect(GREEN, (bar.x, bar.y, max(4, int(bar.width * progress)), bar.height), 3)
+    pygame.draw.circle(screen, GREEN, (bar.x + int(bar.width * progress), bar.y + 3), 5)
+    for mark in range(1, 3):
+        rect((57, 83, 89), (bar.x + mark * bar.width // 3, bar.y - 2, 1, 10))
+    text(f"RESCUED: {rescued}", 886, 734, 12, MUTED)
 
 
 def draw_map_labels():
@@ -376,8 +617,9 @@ def draw_actor(a):
         text(a.state, x-23, y+36, 12)
 
 
-buttons = [(pygame.Rect(944, 370+i*43, 232, 35), order, label)
-           for i, (order, label) in enumerate([('Rescue', '[E]  Rescue student'), ('Follow', '[F]  Follow Commander'), ('Hold', '[H]  Hold position')])]
+buttons = [(pygame.Rect(946, 468, 228, 26), 'Rescue', '[E] RESCUE'),
+           (pygame.Rect(946, 500, 111, 26), 'Follow', '[F] FOLLOW'),
+           (pygame.Rect(1063, 500, 111, 26), 'Hold', '[H] HOLD')]
 
 
 CAMPUS_FOG = CloudFog()
@@ -538,6 +780,7 @@ def draw():
             draw_state_overlay()
         return
     screen.fill((16, 26, 32))
+    t = pygame.time.get_ticks() / 1000
     text('CAMPUS / CRISIS', 22, 17, 32)
     text('FIRST RESPONSE     /     PLAYABLE PROTOTYPE 01', 24, 58, 12, MUTED)
     text(f'{game.rescued_count:02}/{len(game.students):02}  STUDENTS EXTRACTED', 555, 29, 16, GREEN)
@@ -546,28 +789,57 @@ def draw():
     rect((76, 101, 107) if audio_muted else (51, 92, 81), mute_button, 6)
     text('MUTED [M]' if audio_muted else 'SOUND ON [M]', 1061, 53, 12, INK)
     draw_world()
+    # ---- Mission Control side panel: sectioned, divided, icon-anchored ----
     rect(PANEL, (932, 94, 256, 640), 8)
     rect(PANEL_EDGE, (932, 94, 256, 640), 8, 1)
-    rect((29, 54, 58), (932, 94, 256, 48), 8)
-    text('MISSION CONTROL', 946, 110, 18, (220, 235, 230))
-    text(f"SECTOR {game.campaign_level}  /  3", 946, 140, 12, (244, 195, 109))
-    text(game.mission['title'].upper(), 946, 157, 14, GREEN)
-    text(game.mission['objective'], 946, 175, 12, MUTED)
-    text(f"{len(game.students)} students  |  {len(game.zombies)} zombies  |  {int(game.time)} sec", 946, 191, 12, MUTED)
-    for i, a in enumerate((game.leader, game.rescuer, game.medic, *game.defenders, game.scout, game.student)):
-        y = 207+i*17
-        text(actor_label(a), 946, y, 13)
-        pygame.draw.circle(screen, ROLE_COLORS[a.role], (1030, y+9), 4)
-        rect((46, 60, 63), (1040, y+5, 100, 8), 4)
-        rect(GREEN if a.hp > 35 else (237, 119, 110), (1040, y+5, int(a.hp), 8), 4)
+    rect((29, 54, 58), (932, 94, 256, 44), 8)
+    pygame.draw.circle(screen, GREEN if not game.result else AMBER, (950, 116), 4)
+    text('MISSION CONTROL', 962, 106, 18, (220, 235, 230))
+    draw_divider(139)
+    text(f"SECTOR {game.campaign_level} / 3", 946, 148, 12, AMBER)
+    clip_text(game.mission['title'].upper(), 946, 164, 14, GREEN, 228)
+    clip_text(game.mission['objective'], 946, 182, 12, MUTED, 228)
+    draw_icon_person(950, 208)
+    text(str(len(game.students)), 960, 202, 12)
+    draw_icon_skull(994, 208)
+    text(str(len(game.zombies)), 1004, 202, 12)
+    draw_icon_clock(1040, 208)
+    text(f'{int(game.time)}s', 1050, 202, 12, AMBER)
     intel = 'STUDENT LOCATED' if game.discovered['Student'] else 'SCOUT SEARCHING FOR STUDENT'
-    text(intel, 946, 327, 12, GREEN if game.discovered['Student'] else (244, 208, 104))
-    text('COMMAND PANEL' if player_role == 'Commander' else f'PLAYER CONTROLS: {player_role.upper()}', 946, 342, 12, (244, 195, 109))
+    clip_text(intel, 946, 222, 12, GREEN if game.discovered['Student'] else AMBER_TEXT, 228)
+    draw_divider(238)
+    text('TEAM STATUS', 946, 246, 12, MUTED)
+    for i, a in enumerate((game.leader, game.rescuer, game.medic, *game.defenders, game.scout, game.student)):
+        y = 262 + i * 20
+        top = game.max_hp(a)
+        low = a.hp < .35 * top
+        pygame.draw.circle(screen, ROLE_COLORS[a.role], (952, y + 9), 4)
+        clip_text(actor_label(a), 962, y + 2, 12, INK, 66)
+        rect((46, 60, 63), (1036, y + 4, 120, 10), 5)
+        rect(DANGER if low else GREEN, (1036, y + 4, max(6, int(120 * a.hp / top)), 10), 5)
+        if low:  # a breathing outline makes critical teammates unmissable
+            glow = pygame.Surface((126, 16), pygame.SRCALPHA)
+            pygame.draw.rect(glow, (*DANGER, int(70 + 60 * math.sin(t * 6))), (0, 0, 126, 16), width=2, border_radius=8)
+            screen.blit(glow, (1033, y + 1))
+    draw_divider(404)
+    active_targets = [f'{z.name} → {z.target_name}' for z in game.zombies if z.target_name]
+    if active_targets:
+        rect((60, 25, 25), (940, 408, 240, 30), 4)
+        draw_warning_icon(954, 423)
+        text('THREAT', 968, 412, 12, DANGER_TEXT)
+        clip_text(', '.join(active_targets), 946, 426, 12, DANGER_TEXT, 224)
+    else:
+        draw_warning_icon(954, 423, (120, 140, 142))
+        text('THREAT', 968, 412, 12, MUTED)
+        text('No active pursuit', 946, 426, 12, MUTED)
+    draw_divider(444)
+    text('YOUR CONTROLS: '+player_role.upper() if player_role != 'Commander' else 'COMMAND PANEL', 946, 452, 12, AMBER)
     if player_role == 'Commander':
         for bounds, order, label in buttons:
-            rect((54, 100, 90) if game.order == order else (31, 46, 55), bounds, 5)
-            rect(GREEN if game.order == order else (52, 75, 80), bounds, 5, 1)
-            text(label, bounds.x+12, bounds.y+7, 14)
+            active = game.order == order
+            rect((54, 100, 90) if active else (31, 46, 55), bounds, 5)
+            rect(GREEN if active else (52, 75, 80), bounds, 5, 1)
+            text(label, bounds.x + 9, bounds.y + 6, 12, INK if active else MUTED)
     else:
         action_help = {
             'Rescuer': '[E] Start escort / collect nearby item',
@@ -575,29 +847,32 @@ def draw():
             'Defender': '[E] Engage zombie / collect ammo',
             'Scout': '[E] Scan nearby sector / collect item',
         }[player_role]
-        rect((31, 46, 55), (944, 370, 232, 72), 5)
-        text(action_help, 956, 385, 12, INK)
-        text('WASD move  |  Shift run', 956, 412, 12, MUTED)
-    text('AI TASK ALLOCATION', 946, 503, 14, GREEN)
+        rect((24, 38, 46), (946, 468, 228, 58), 5)
+        rect((52, 75, 80), (946, 468, 228, 58), 5, 1)
+        text(action_help, 956, 478, 12, INK)
+        text('WASD move  |  Shift run', 956, 498, 12, MUTED)
+    draw_divider(540)
+    draw_icon_medkit(954, 562)
+    text(str(game.medkits), 966, 556, 12)
+    draw_icon_ammo(1002, 562)
+    text(str(game.ammo), 1014, 556, 12)
+    draw_icon_fuel(1048, 562)
+    text(f'{game.fuel}/{game.fuel_required}', 1060, 556, 12, (70, 160, 215))
+    draw_divider(576)
+    text('AI DECISIONS', 946, 584, 12, MUTED)
     for i, a in enumerate((game.scout, game.medic, *game.defenders)):
+        y = 600 + i * 15
         task = 'You are in control' if a is game.controlled_actor() else f'{a.task}  [{a.task_score}]'
-        text(f'{actor_label(a)}: {task}', 946, 524+i*16, 12, MUTED)
-    text(f'Medkits: {game.medkits}  |  Ammo: {game.ammo}', 946, 589, 12, (126, 224, 195))
-    text(f'Fuel secured: {game.fuel}/{game.fuel_required}', 946, 604, 12, (70, 160, 215))
-    active_targets = [f'{z.name} -> {z.target_name}' for z in game.zombies if z.target_name]
-    text('THREAT: '+(', '.join(active_targets) if active_targets else 'No active pursuit'), 946, 619, 12, (244, 143, 133))
-    text('FIELD COMMS', 946, 636, 14, GREEN)
-    y = 659
-    for line in game.logs[-2:]:
-        words, current = line.split(), ''
-        for word in words:
-            if len(current + word) > 31:
-                text(current, 946, y, 12, MUTED)
-                y += 17
-                current = ''
-            current += word+' '
-        text(current, 946, y, 12, MUTED)
-        y += 26
+        controlled = a is game.controlled_actor()
+        clip_text(f'{actor_label(a)}: {task}', 946, y, 12, AMBER if controlled else MUTED, 228)
+    draw_divider(664)
+    text('FIELD COMMS', 946, 672, 12, GREEN)
+    rect((74, 129, 117), (940, 688, 2, 42))
+    newest = wrap_line(game.logs[-1], 34)[:2]
+    for row, line in enumerate(newest):
+        text(('> ' if row == 0 else '  ')+line, 948, 690 + row * 15, 12, MUTED)
+    if len(game.logs) > 1 and len(newest) < 2:
+        clip_text(game.logs[-2], 948, 720, 12, (100, 116, 118), 222)
     controls = ('WASD Move  |  Shift Run  |  Space Strike  |  E Rescue/Command  |  Alt Names  |  F4 Full Map  |  F11 Window  |  P Pause  |  R Restart'
                 if player_role == 'Commander' else 'WASD Move  |  Shift Run  |  E Context Action  |  Alt Names  |  F4 Full Map  |  F11 Window  |  P Pause  |  R Restart')
     text(controls, 22, 742, 12, MUTED)
@@ -608,40 +883,80 @@ def draw():
 
 
 def draw_menu():
+    """All pre-game screens share the animated backdrop and menu card."""
     menu_buttons.clear()
-    screen.fill((12, 23, 29))
-    for y in range(0, HEIGHT, 32):
-        for x in range(0, WIDTH, 32):
-            screen.blit(GRASS, (x, y))
-    shade = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA); shade.fill((7, 16, 22, 210)); screen.blit(shade, (0, 0))
-    rect((24, 38, 45), (244, 106, 712, 548), 14)
-    rect((74, 129, 117), (244, 106, 712, 548), 14, 2)
-    text('CAMPUS / CRISIS', 315, 175, 48)
-    text('MULTI-AGENT ZOMBIE RESCUE', 319, 235, 18, GREEN)
+    t = pygame.time.get_ticks() / 1000
+    draw_menu_backdrop(t)
+    draw_menu_card()
     if screen_state == 'menu':
-        text('A rescue team is waiting for your command.', 319, 294, 18, MUTED)
-        menu_button('briefing', 'START MISSION  [ENTER]', (355, 350, 490, 48), True)
-        menu_button('howto', 'HOW TO PLAY  [H]', (355, 412, 490, 44))
-        menu_button('quit', 'QUIT  [ESC]', (355, 470, 490, 44))
+        draw_menu_title(314, 128)
+        text('MULTI-AGENT ZOMBIE RESCUE', 318, 190, 18, GREEN)
+        draw_scan_line(318, 224, 568, t)
+        text('A rescue team is waiting for your command.', 318, 244, 14, MUTED)
+        draw_lineup(t)
+        draw_cta('briefing', 'DEPLOY RESCUE TEAM  [ENTER]', (314, 424, 572, 56), True)
+        draw_ghost('howto', 'HOW TO PLAY  [H]', (314, 500, 278, 44))
+        draw_ghost('quit', 'QUIT  [ESC]', (608, 500, 278, 44))
+        rect(PANEL_EDGE, (314, 596, 572, 1))
+        text('FIRST RESPONSE  •  PLAYABLE PROTOTYPE 01', 314, 614, 12, MUTED)
+        draw_campaign_strip(t)
     elif screen_state == 'briefing':
-        text('MISSION BRIEFING', 319, 290, 24, GREEN)
-        text(f"CAMPAIGN: Sector {campaign['unlocked_sector']} / 3   |   Successful rescues: {campaign['completed']}", 319, 315, 13, (244, 195, 109))
-        model_status = (f"ML MODEL: trained on {adaptive_data['missions']} missions  |  Training fit: {adaptive_data['accuracy']:.0%}"
-                        if adaptive_data['trained'] else f"ML MODEL: collecting data ({adaptive_data['missions']}/15 missions)")
-        text(model_status, 319, 340, 13, MUTED)
-        text('ADAPTIVE: '+adaptive_plan['label']+' — '+adaptive_plan['reason'], 319, 365, 12, GREEN)
-        base_time = {'Easy': 300, 'Normal': 240, 'Hard': 180}[difficulty]
-        text(f"PLAYER SETTING: {difficulty}   |   ML adjustment: {adaptive_plan['label']}", 319, 391, 12, INK)
-        text('Each campus incident varies its students, zombies, resources, objective, and time limit.', 319, 415, 14, MUTED)
-        text('CHOOSE DIFFICULTY', 319, 438, 14, MUTED)
-        for index, label in enumerate(('Easy', 'Normal', 'Hard')):
-            menu_button('difficulty_'+label, label+('  ✓' if difficulty == label else ''), (319+index*170, 463, 150, 38), difficulty == label)
-        menu_button('deploy', 'CHOOSE PLAYABLE ROLE  [ENTER]', (319, 525, 330, 42), True)
-        menu_button('back', 'BACK  [ESC]', (664, 525, 180, 42))
-        menu_button('reset_campaign', 'RESET CAMPAIGN  [X]', (319, 580, 330, 38))
+        draw_menu_title(314, 116)
+        text('MULTI-AGENT ZOMBIE RESCUE', 318, 178, 18, GREEN)
+        rect((74, 129, 117), (314, 226, 572, 1))
+        # Left column: mission story and difficulty.
+        text('MISSION BRIEFING', 314, 250, 18, GREEN)
+        text('Your rescue team adapts to', 314, 280, 14, MUTED)
+        text('your play style, mission by mission.', 314, 300, 14, MUTED)
+        text('CHOOSE DIFFICULTY', 314, 344, 12, MUTED)
+        for index, (label, stars) in enumerate((('Easy', 1), ('Normal', 2), ('Hard', 3))):
+            bounds = pygame.Rect(314 + index * 96, 364, 88, 46)
+            menu_buttons['difficulty_' + label] = bounds
+            active = difficulty == label
+            hovered = bounds.collidepoint(pygame.mouse.get_pos())
+            rect((55, 105, 92) if active else (44, 66, 74) if hovered else (30, 48, 56), bounds, 7)
+            rect(GREEN if active else (91, 117, 125), bounds, 7, 1)
+            rendered = fonts[13].render(label, True, INK if active else MUTED)
+            screen.blit(rendered, rendered.get_rect(midtop=(bounds.centerx, bounds.y + 7)))
+            for star in range(3):
+                if star < stars:
+                    draw_star(bounds.x + 26 + star * 18, bounds.y + 33, 6, AMBER if active else (120, 140, 142))
+                else:
+                    draw_star(bounds.x + 26 + star * 18, bounds.y + 33, 6, (48, 66, 70))
+        text('Every incident varies students, zombies,', 314, 434, 12, MUTED)
+        text('resources and the time you have left.', 314, 450, 12, MUTED)
+        draw_ghost('reset_campaign', 'RESET CAMPAIGN  [X]', (314, 496, 220, 42), 14)
+        # Right column: campaign progress and AI readiness, minus the jargon.
+        text(f"SECTOR {campaign['unlocked_sector']} / 3", 624, 250, 24, INK)
+        bar = pygame.Rect(624, 286, 292, 10)
+        progress = (campaign['unlocked_sector'] - 1) / 3
+        rect((30, 46, 52), bar, 5)
+        rect(GREEN, (bar.x, bar.y, max(4, int(bar.width * progress)), bar.height), 5)
+        for mark in range(1, 3):
+            rect((57, 83, 89), (bar.x + mark * bar.width // 3, bar.y - 2, 1, 14))
+        text(f"Successful rescues: {campaign['completed']}", 624, 306, 12, MUTED)
+        text('AI READINESS', 624, 346, 12, MUTED)
+        if adaptive_data['trained']:
+            readiness, ready_label = adaptive_data['accuracy'], 'HIGH' if adaptive_data['accuracy'] > .8 else 'STABLE'
+        else:
+            readiness, ready_label = adaptive_data['missions'] / 15, f"LEARNING {adaptive_data['missions']}/15"
+        text(ready_label, 916 - fonts[12].size(ready_label)[0], 346, 12, GREEN)
+        ready_bar = pygame.Rect(624, 366, 292, 10)
+        rect((30, 46, 52), ready_bar, 5)
+        rect(GREEN, (ready_bar.x, ready_bar.y, max(3, int(ready_bar.width * readiness)), ready_bar.height), 5)
+        friendly = (adaptive_plan['reason'].replace('ML predicts', 'The team predicts')
+                    .replace('chance of success from recent play', 'success from your recent play'))
+        for row, line in enumerate(wrap_line(friendly, 34)[:2]):
+            text(line, 624, 396 + row * 16, 12, MUTED)
+        text('TEAM MODE: '+adaptive_plan['label'].replace('ML ', ''), 624, 442, 12, AMBER)
+        text(f"PLAYER SETTING: {difficulty}", 624, 460, 12, INK)
+        draw_cta('deploy', 'CHOOSE PLAYABLE ROLE  [ENTER]', (314, 596, 380, 52))
+        draw_ghost('back', 'BACK  [ESC]', (724, 600, 192, 44))
     elif screen_state == 'role_select':
-        text('CHOOSE YOUR ROLE', 319, 270, 24, GREEN)
-        text('You control this role. The rest of the rescue team uses AI decisions.', 319, 302, 14, MUTED)
+        draw_menu_title(314, 116)
+        text('MULTI-AGENT ZOMBIE RESCUE', 318, 178, 18, GREEN)
+        text('CHOOSE YOUR ROLE', 314, 236, 24, GREEN)
+        text('You control this role. The rest of the rescue team uses AI decisions.', 318, 270, 14, MUTED)
         roles = (
             ('Commander', 'Coordinate the team and issue rescue orders.'),
             ('Rescuer', 'Reach located students and escort them to safety.'),
@@ -650,19 +965,25 @@ def draw_menu():
             ('Scout', 'Explore fog and scan nearby campus sectors.'),
         )
         for index, (role, description) in enumerate(roles):
-            y = 338 + index*43
+            y = 306 + index * 48
             active = player_role == role
-            menu_button('role_'+role, f'[{index+1}]  {role.upper()}  —  {description}', (319, y, 550, 35), active)
-        menu_button('launch_role', f'DEPLOY AS {player_role.upper()}  [ENTER]', (319, 565, 330, 42), True)
-        menu_button('back', 'BACK', (664, 565, 180, 42))
+            menu_button('role_'+role, f'[{index+1}]  {role.upper()}  —  {description}', (314, y, 572, 40), active)
+            sprite = pygame.transform.smoothscale(CHARACTER_SPRITES['Leader' if role == 'Commander' else role]['right'][0], (14, 34))
+            screen.blit(sprite, (328, y + 4))
+        draw_cta('launch_role', f'DEPLOY AS {player_role.upper()}  [ENTER]', (314, 560, 380, 52))
+        draw_ghost('back', 'BACK', (724, 564, 192, 44))
     else:
-        text('HOW TO PLAY', 319, 290, 24, GREEN)
-        text('Choose Commander or a field role before each mission.', 319, 332, 16, MUTED)
-        text('WASD moves your role. E performs its context action.', 319, 364, 16, MUTED)
-        text('Resources help the team, but every Safe Zone tile releases an escort.', 319, 396, 16, MUTED)
-        text('F11 switches between fullscreen and a window.', 319, 428, 16, MUTED)
-        text('Hold Alt to show every name. Ring colours mark each role; zombies are red.', 319, 460, 16, MUTED)
-        menu_button('back', 'BACK TO MENU  [ESC]', (319, 515, 330, 48), True)
+        draw_menu_title(314, 116)
+        text('MULTI-AGENT ZOMBIE RESCUE', 318, 178, 18, GREEN)
+        text('HOW TO PLAY', 314, 236, 24, GREEN)
+        for i, line in enumerate((
+                'Choose Commander or a field role before each mission.',
+                'WASD moves your role. E performs its context action.',
+                'Resources help the team, but every Safe Zone tile releases an escort.',
+                'F11 switches between fullscreen and a window.',
+                'Hold Alt to show every name. Ring colours mark each role; zombies are red.')):
+            text(line, 318, 280 + i * 34, 14, MUTED)
+        draw_cta('back', 'BACK TO MENU  [ESC]', (314, 560, 380, 52))
 
 
 running, frames = True, 0
