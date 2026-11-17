@@ -4,16 +4,7 @@ A standalone desktop Python/Pygame game prototype. Command one rescue agent,
 protect a stranded student from a patrolling zombie, and escort the student to
 the green Safe Zone within three minutes.
 
-## Run on this computer (PowerShell)
-
-```powershell
-cd "C:\Users\Srushti Maurya\OneDrive\WebDevlopment Projects\AI PROJECT"
-.\.venv\Scripts\python.exe main.py
-```
-
-Or double-click `run.bat`. No environment activation is required.
-
-## Setup on another computer
+## Setup
 
 Install Python 3.10 or newer, then run in this project folder:
 
